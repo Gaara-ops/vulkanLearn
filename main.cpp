@@ -43,8 +43,11 @@ private:
     GLFWwindow* window = nullptr;//窗口
     VkInstance instance;//vulkan实例
     VkDebugUtilsMessengerEXT callback;//存储回调函数信息
-    //存储我们使用的显卡信息
+    //存储我们使用的显卡信息,物理设备
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+    VkDevice device;//逻辑设备
+    VkQueue graphicsQueue;//逻辑设备的队列句柄
+
 
     ///创建glfw窗口
     void initWindow(){
@@ -210,11 +213,38 @@ private:
             throw std::runtime_error("failed to find a suitable gpu!");
         }
     }
+    //创建一个逻辑设备
+    void createLogicalDevice(){
+        QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
+        //描述了针对一个队列族我们所需的队列数量。
+        VkDeviceQueueCreateInfo queueCreateInfo = {};
+        queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        queueCreateInfo.queueFamilyIndex=indices.graphicsFamily;
+        queueCreateInfo.queueCount = 1;
+        float queuePriority = 1.0f;
+        queueCreateInfo.pQueuePriorities = &queuePriority;
+        //程序使用的设备特性
+        VkPhysicalDeviceFeatures deviceFeatures = {};
+
+        VkDeviceCreateInfo createInfo = {};
+        createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        createInfo.pQueueCreateInfos = &queueCreateInfo;
+        createInfo.queueCreateInfoCount = 1;
+        createInfo.pEnabledFeatures = &deviceFeatures;
+        //创建逻辑设备
+        if(vkCreateDevice(physicalDevice,&createInfo,nullptr,
+                          &device) != VK_SUCCESS){
+            throw std::runtime_error("failed to create logical device!");
+        }
+        //获取指定队列族的队列句柄
+        vkGetDeviceQueue(device,indices.graphicsFamily,0,&graphicsQueue);
+    }
 
     void initVulkan(){
         createInstance();//创建vulkan实例
         setupDebugCallback();//调试回调
         pickPhysicalDevice();//选择一个物理设备
+        createLogicalDevice();//创建逻辑设备
     }
     void mainLoop(){
         //添加事件循环
@@ -223,6 +253,7 @@ private:
         }
     }
     void cleanup(){
+        vkDestroyDevice(device,nullptr);//销毁逻辑设备
         if(enableValidationLayers){
             DestroyDebugUtilsMessengerEXT(instance,callback,nullptr);
         }
