@@ -23,6 +23,14 @@ const bool enableValidationLayers = false;
 const bool enableValidationLayers = true;
 #endif
 
+
+struct QueueFamilyIndices{
+    int graphicsFamily = -1;//表示没有找到满足需求的队列族
+    bool isComplete(){
+        return graphicsFamily >= 0;
+    }
+};
+
 class HelloTriangle{
 public:
     void run(){
@@ -35,6 +43,8 @@ private:
     GLFWwindow* window = nullptr;//窗口
     VkInstance instance;//vulkan实例
     VkDebugUtilsMessengerEXT callback;//存储回调函数信息
+    //存储我们使用的显卡信息
+    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
 
     ///创建glfw窗口
     void initWindow(){
@@ -161,9 +171,50 @@ private:
             throw std::runtime_error("faild to set up debug callback!");
         }
     }
+    //检查设备是否满足需求
+    bool isDeviceSuitable(VkPhysicalDevice device){
+        QueueFamilyIndices indices = findQueueFamilies(device);
+        return indices.isComplete();
+
+        //以下代码不使用，仅做了解
+        //基础设备属性，名称/类型/支持的vulkan版本
+        VkPhysicalDeviceProperties deviceProperties;
+        //特征属性，纹理压缩/64位浮点/多视口渲染
+        VkPhysicalDeviceFeatures deviceFeatures;
+        vkGetPhysicalDeviceProperties(device,&deviceProperties);
+        vkGetPhysicalDeviceFeatures(device,&deviceFeatures);
+        //显卡是否支持集合着色器
+        bool res =
+        (deviceProperties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+                && deviceFeatures.geometryShader;
+        return res;
+    }
+
+    //选择一个物理设备
+    void pickPhysicalDevice(){
+        uint32_t deviceCount = 0;
+        vkEnumeratePhysicalDevices(instance,&deviceCount,nullptr);
+        if(deviceCount == 0){
+            throw std::runtime_error(
+                        "failed to find gpus with vulkan support!");
+        }
+        std::vector<VkPhysicalDevice> devices(deviceCount);
+        vkEnumeratePhysicalDevices(instance,&deviceCount,devices.data());
+        for(const auto& device : devices){
+            if(isDeviceSuitable(device)){
+                physicalDevice = device;
+                break;
+            }
+        }
+        if(physicalDevice == VK_NULL_HANDLE){
+            throw std::runtime_error("failed to find a suitable gpu!");
+        }
+    }
+
     void initVulkan(){
         createInstance();//创建vulkan实例
         setupDebugCallback();//调试回调
+        pickPhysicalDevice();//选择一个物理设备
     }
     void mainLoop(){
         //添加事件循环
@@ -242,6 +293,35 @@ private:
             void* pUserData){
         std::cerr<<"validation layer: "<<pCallbackData->pMessage<<std::endl;
         return VK_FALSE;
+    }
+    //查找出满足我们需求的队列族
+    QueueFamilyIndices findQueueFamilies(VkPhysicalDevice device){
+        uint32_t queueFamilyCount = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(device,
+                                                 &queueFamilyCount,nullptr);
+        /**
+        VkQueueFamilyProperties包含队列族的很多信息，
+        比如支持的操作类型，该队列族可以创建的队列个数
+        */
+        std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+        vkGetPhysicalDeviceQueueFamilyProperties(device,
+                                    &queueFamilyCount,queueFamilies.data());
+
+        QueueFamilyIndices indices;
+        int i=0;
+        for(const auto& queueFamily : queueFamilies){
+            //VK_QUEUE_GRAPHICS_BIT表示支持图形指令
+            if(queueFamily.queueCount>0 &&
+                    queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT){
+                indices.graphicsFamily = i;
+            }
+            if(indices.isComplete()){
+                break;
+            }
+            i++;
+        }
+
+        return indices;
     }
 };
 
