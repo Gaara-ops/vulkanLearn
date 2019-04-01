@@ -9,12 +9,17 @@
 #include <stdexcept>
 #include <functional>
 #include <cstdlib>
+#include <set>
 
 const int WIDTH = 800;
 const int HEIGHT = 600;
 //校验层的名称
 const std::vector<const char*> validataionLayers = {
     "VK_LAYER_LUNARG_standard_validation"
+};
+//设备扩展列表
+const std::vector<const char*> deviceExtensions = {
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME
 };
 
 #ifdef NDEBUG
@@ -25,10 +30,19 @@ const bool enableValidationLayers = true;
 
 
 struct QueueFamilyIndices{
+    //绘制指令的队列族索引
     int graphicsFamily = -1;//表示没有找到满足需求的队列族
+    //支持表现的队列族索引
+    int presentFamily = -1;
     bool isComplete(){
-        return graphicsFamily >= 0;
+        return graphicsFamily >= 0 && presentFamily>=0;
     }
+};
+//查询得到的交换链细节信息：
+struct SwapChainSupportDetails {
+    VkSurfaceCapabilitiesKHR capabilities;
+    std::vector<VkSurfaceFormatKHR> formats;
+    std::vector<VkPresentModeKHR> presentModes;
 };
 
 class HelloTriangle{
@@ -47,6 +61,8 @@ private:
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkDevice device;//逻辑设备
     VkQueue graphicsQueue;//逻辑设备的队列句柄
+    VkSurfaceKHR surface;
+    VkQueue presentQueue;//呈现队列
 
 
     ///创建glfw窗口
@@ -74,9 +90,9 @@ private:
         VkApplicationInfo appinfo={};
         appinfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appinfo.pApplicationName = "hello";
-        appinfo.applicationVersion = VK_MAKE_VERSION(1,1,101);
+        appinfo.applicationVersion = VK_MAKE_VERSION(1,1,77);
         appinfo.pEngineName = "No Engine";
-        appinfo.engineVersion = VK_MAKE_VERSION(1,1,101);
+        appinfo.engineVersion = VK_MAKE_VERSION(1,1,77);
         appinfo.apiVersion = VK_API_VERSION_1_1;
 
         //设置vulkan实例信息
@@ -174,10 +190,37 @@ private:
             throw std::runtime_error("faild to set up debug callback!");
         }
     }
+    //检测交换链支持
+    bool checkDeviceExtensionSupport(VkPhysicalDevice device){
+        //体枚举设备扩展列表,检测所需的扩展是否存在
+        uint32_t extensionCount;
+        vkEnumerateDeviceExtensionProperties(
+                    device,nullptr,&extensionCount,nullptr);
+        std::vector<VkExtensionProperties> availableExtensions(extensionCount);
+        vkEnumerateDeviceExtensionProperties(
+                    device,nullptr,&extensionCount,availableExtensions.data());
+        std::set<std::string> requiredExtensions(deviceExtensions.begin(),
+                                                 deviceExtensions.end());
+        for(const auto& extension : availableExtensions){
+            requiredExtensions.erase(extension.extensionName);
+        }
+        return requiredExtensions.empty();
+    }
+
     //检查设备是否满足需求
     bool isDeviceSuitable(VkPhysicalDevice device){
         QueueFamilyIndices indices = findQueueFamilies(device);
-        return indices.isComplete();
+        bool extensionsSupported = checkDeviceExtensionSupport(device);
+
+        bool swapChainAdequate = false;
+        if(extensionsSupported){
+            SwapChainSupportDetails swapChainSupport =
+                    querySwapChainSupport(device);
+            swapChainAdequate= !swapChainSupport.formats.empty()
+                    && !swapChainSupport.presentModes.empty();
+        }
+        return indices.isComplete() && extensionsSupported &&
+                swapChainAdequate;
 
         //以下代码不使用，仅做了解
         //基础设备属性，名称/类型/支持的vulkan版本
@@ -216,21 +259,32 @@ private:
     //创建一个逻辑设备
     void createLogicalDevice(){
         QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
-        //描述了针对一个队列族我们所需的队列数量。
-        VkDeviceQueueCreateInfo queueCreateInfo = {};
-        queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        queueCreateInfo.queueFamilyIndex=indices.graphicsFamily;
-        queueCreateInfo.queueCount = 1;
+        std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
+        std::set<int> uniqueQueueFamilies = {indices.graphicsFamily,
+                                             indices.presentFamily};
         float queuePriority = 1.0f;
-        queueCreateInfo.pQueuePriorities = &queuePriority;
+        for(int queueFamily : uniqueQueueFamilies){
+            //描述了针对一个队列族我们所需的队列数量。
+            VkDeviceQueueCreateInfo queueCreateInfo = {};
+            queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+            queueCreateInfo.queueFamilyIndex=queueFamily;
+            queueCreateInfo.queueCount = 1;
+            queueCreateInfo.pQueuePriorities = &queuePriority;
+            queueCreateInfos.push_back(queueCreateInfo);
+        }
         //程序使用的设备特性
         VkPhysicalDeviceFeatures deviceFeatures = {};
 
         VkDeviceCreateInfo createInfo = {};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        createInfo.pQueueCreateInfos = &queueCreateInfo;
-        createInfo.queueCreateInfoCount = 1;
+        createInfo.queueCreateInfoCount =
+                static_cast<uint32_t>(queueCreateInfos.size());
+        createInfo.pQueueCreateInfos = queueCreateInfos.data();
         createInfo.pEnabledFeatures = &deviceFeatures;
+        //启用交换链扩展
+        createInfo.enabledExtensionCount=
+                static_cast<uint32_t>(deviceExtensions.size());
+        createInfo.ppEnabledExtensionNames = deviceExtensions.data();
         //创建逻辑设备
         if(vkCreateDevice(physicalDevice,&createInfo,nullptr,
                           &device) != VK_SUCCESS){
@@ -238,11 +292,21 @@ private:
         }
         //获取指定队列族的队列句柄
         vkGetDeviceQueue(device,indices.graphicsFamily,0,&graphicsQueue);
+        vkGetDeviceQueue(device,indices.presentFamily,0,&presentQueue);
+    }
+    //创建窗口表面
+    void createSurface(){
+        //hwnd:窗口句柄   hinstance:进程实例句柄
+        VkResult res = glfwCreateWindowSurface(instance,window,nullptr,&surface);
+        if(res != VK_SUCCESS){
+            throw std::runtime_error("failed to create window surface!");
+        }
     }
 
     void initVulkan(){
         createInstance();//创建vulkan实例
         setupDebugCallback();//调试回调
+        createSurface();//创建窗口表面
         pickPhysicalDevice();//选择一个物理设备
         createLogicalDevice();//创建逻辑设备
     }
@@ -340,11 +404,19 @@ private:
 
         QueueFamilyIndices indices;
         int i=0;
+        VkBool32 presentSupport = false;
         for(const auto& queueFamily : queueFamilies){
             //VK_QUEUE_GRAPHICS_BIT表示支持图形指令
             if(queueFamily.queueCount>0 &&
                     queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT){
                 indices.graphicsFamily = i;
+                //indices.presentFamily = i;
+            }
+            //查找带有呈现图像到窗口表面能力的队列族
+            vkGetPhysicalDeviceSurfaceSupportKHR(
+                        device,i,surface,&presentSupport);
+            if(queueFamily.queueCount>0 && presentSupport){
+                indices.presentFamily = i;
             }
             if(indices.isComplete()){
                 break;
@@ -353,6 +425,34 @@ private:
         }
 
         return indices;
+    }
+    //查询交换链支持细节
+    SwapChainSupportDetails querySwapChainSupport(VkPhysicalDevice device){
+        SwapChainSupportDetails details;
+        //查询基础表面特性
+        vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+                    device,surface,&details.capabilities);
+        //查询表面支持的格式
+        uint32_t formatCount;
+        vkGetPhysicalDeviceSurfaceFormatsKHR(
+                    device,surface,&formatCount,nullptr);
+        if(formatCount != 0){
+            details.formats.resize(formatCount);
+            vkGetPhysicalDeviceSurfaceFormatsKHR(
+                        device,surface,&formatCount,details.formats.data());
+        }
+        //查询支持的呈现模式
+        uint32_t presentModeCount;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(
+                    device,surface,&presentModeCount,nullptr);
+        if(presentModeCount != 0){
+            details.presentModes.resize(presentModeCount);
+            vkGetPhysicalDeviceSurfacePresentModesKHR(
+                        device,surface,&presentModeCount,
+                        details.presentModes.data());
+        }
+
+        return details;
     }
 };
 

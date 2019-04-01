@@ -1,7 +1,7 @@
 QT += core
 QT -= gui
 
-CONFIG += c++17
+CONFIG += c++11
 
 TARGET = VulkanLearn
 CONFIG += console
@@ -13,8 +13,8 @@ SOURCES += main.cpp
 
 GLM_DIR = F:/opengl/glm-0.9.9.4/qt5.6/lib-release
 GLFW_DIR = F:/opengl/glfw-3.2.1/qt5.6/lib-release
-VulKan_LIB_DIR = D:/VulkanSDK/1.1.101.0/Source/lib32
-VulKan_DIR = D:/VulkanSDK/1.1.101.0
+VulKan_LIB_DIR = D:/VulkanSDK/1.1.77.0/Source/lib32
+VulKan_DIR = D:/VulkanSDK/1.1.77.0/
 
 INCLUDEPATH += $${GLM_DIR}/include
 INCLUDEPATH += $${GLFW_DIR}/include
