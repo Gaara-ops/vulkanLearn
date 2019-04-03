@@ -123,6 +123,16 @@ private:
     //每一帧创建一个VkFence 栅栏对象--12
     std::vector<VkFence> inFlightFences ;
 
+    //标记窗口大小是否发生改变：
+    bool framebufferResized = false;
+
+    //为静态函数才能将其用作回调函数
+    static void framebufferResizeCallback(GLFWwindow* window,int width ,
+                                           int height){
+        auto app =
+        reinterpret_cast<HelloTriangle*>(glfwGetWindowUserPointer(window));
+        app->framebufferResized = true;
+    }
 
     ///初始化glfw
     void initWindow(){
@@ -130,7 +140,7 @@ private:
         //显示阻止自动创建opengl上下文
         glfwWindowHint(GLFW_CLIENT_API,GLFW_NO_API);
         //禁止窗口大小改变
-        glfwWindowHint(GLFW_RESIZABLE,GLFW_FALSE);
+        //glfwWindowHint(GLFW_RESIZABLE,GLFW_FALSE);
         /**
         glfwCreateWindow 函数:
         前三个参数指定了要创建的窗口的宽度，高度和标题.
@@ -140,6 +150,10 @@ private:
         //创建窗口
         window = glfwCreateWindow(WIDTH,HEIGHT,"vulakn",
                                   nullptr,nullptr);
+        //存储在 GLFW 窗口相关的数据
+        glfwSetWindowUserPointer(window , this);
+        //窗口大小改变的回调函数
+        glfwSetFramebufferSizeCallback(window,framebufferResizeCallback);
     }
     //创建VkInstance实例--1
     void createInstance(){
@@ -516,14 +530,18 @@ private:
 
     代码中 max 和 min 函数用于在允许的范围内选择交换范围的高度值和宽度值，
     需要在源文件中包含 algorithm 头文件才能够使用它们
+
+    窗口大小改变后，我们需要重新设置交换链图像的大小
       */
-    //设置交换范围--4
+    //设置交换范围为当前的帧缓冲的实际大小--4
     VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities){
         if(capabilities.currentExtent.width !=
                 std::numeric_limits<uint32_t>::max()){
             return capabilities.currentExtent;
         }else{
-            VkExtent2D actualExtent = {WIDTH, HEIGHT};
+            int width,height;
+            glfwGetFramebufferSize(window,&width,&height);
+            VkExtent2D actualExtent = {width, height};
             actualExtent.width = std::max(capabilities.minImageExtent.width,
                                    std::min(capabilities.maxImageExtent.width,
                                             actualExtent.width));
@@ -622,6 +640,8 @@ private:
         /**
         oldSwapchain需要指定它，是因为应用程序在运行过程中交换链可能会失效。
         比如，改变窗口大小后，交换链需要重建，重建时需要之前的交换链
+
+        可以实现原来的交换链仍在使用时重建新的交换链
           */
         createInfo.oldSwapchain = VK_NULL_HANDLE;
         //创建交换链
@@ -1417,10 +1437,17 @@ private:
           */
         //从交换链获取一张图像
         //交换链是一个扩展特性，所以与它相关的操作都会有 KHR 这一扩展后缀
-        vkAcquireNextImageKHR(device,swapChain,
+        VkResult result =vkAcquireNextImageKHR(device,swapChain,
                               std::numeric_limits<uint64_t>::max(),
                               imageAvailableSemaphores[currentFrame],
                               VK_NULL_HANDLE,&imageIndex);
+        if(result == VK_ERROR_OUT_OF_DATE_KHR){
+            recreateSwapChain();
+            return;
+        }else if(result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR){
+            throw std::runtime_error("failed to acquire swap chain image!");
+        }
+
         //提交信息给指令队列
         VkSubmitInfo submitInfo = {};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1451,6 +1478,12 @@ private:
         可以用它同步提交的指令缓冲执行结束后要进行的操作。
         在这里，我们使用信号量进行同步，没有使用它，将其设置为VK_NULL_HANDLE
           */
+        /**
+         * @brief vkResetFences
+         * 在重建交换链时，重置栅栏 (fence) 对象,
+         * 以防导致我们使用的栅栏 (fence) 处于我们不能确定得状态
+         */
+        vkResetFences(device,1,&inFlightFences[currentFrame]);
         //提交指令缓冲给图形指令队列
         if(vkQueueSubmit(graphicsQueue,1,&submitInfo,
                          inFlightFences[currentFrame])!= VK_SUCCESS){
@@ -1477,8 +1510,21 @@ private:
         的返回值来判断呈现操作是否成功
           */
         presentInfo.pResults = nullptr;
+        /**
+          vkQueuePresentKHR函数返回的信息来判定交换链是否需要重建:
+            VK_ERROR_OUT_OF_DATE_KHR：交换链不能继续使用。通常发生在窗口大小改变后
+            VK_SUBOPTIMAL_KHR：交换链仍然可以使用，但表面属性已经不能准确匹配
+          */
         //请求交换链进行图像呈现操作
-        vkQueuePresentKHR( presentQueue , &presentInfo ) ;
+        result = vkQueuePresentKHR( presentQueue , &presentInfo ) ;
+        if(result == VK_ERROR_OUT_OF_DATE_KHR ||
+                result == VK_SUBOPTIMAL_KHR || framebufferResized){
+            //交换链不完全匹配时也重建交换链
+            framebufferResized = false;
+            recreateSwapChain();
+        }else if(result != VK_SUCCESS){
+            throw std::runtime_error("failed to present swap chain image!");
+        }
         /**
         如果开启校验层后运行程序，观察应用程序的内存使用情况，
         可以发现我们的应用程序的内存使用量一直在慢慢增加。这是由于我
@@ -1493,7 +1539,8 @@ private:
         间都处于空闲状态.
           */
         //等待一个特定指令队列结束执行
-        vkQueueWaitIdle ( presentQueue ) ;
+        //vkQueueWaitIdle ( presentQueue ) ;
+
         //更新currentFrame
         currentFrame = (currentFrame+1) %MAX_FRAMES_IN_FLIGHT;
     }
@@ -1515,6 +1562,8 @@ private:
     }
     //清理资源
     void cleanup(){
+        cleanupSwapChain();//释放交换链相关
+
         //清除为每一帧创建的信号量和VkFence 对象--12
         for(size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++){
             //所有它所同步的指令执行结束后，对它进行清除
@@ -1524,22 +1573,7 @@ private:
         }
         //销毁指令池对象--11
         vkDestroyCommandPool(device,commandPool,nullptr);
-        //销毁帧缓冲对象--10
-        for(auto framebuffer : swapChainFramebuffers){
-            vkDestroyFramebuffer(device,framebuffer,nullptr);
-        }
-        //销毁管线对象--9
-        vkDestroyPipeline ( device , graphicsPipeline , nullptr );
-        //销毁管线布局对象--9
-        vkDestroyPipelineLayout ( device , pipelineLayout , nullptr);
-        //销毁渲染流程对象--9
-        vkDestroyRenderPass ( device , renderPass , nullptr );
-        //销毁图像视图--5
-        for(auto imageView : swapChainImageViews){
-            vkDestroyImageView(device,imageView,nullptr);
-        }
-        //销毁交换链对象，在逻辑设备被清除前调用--4
-        vkDestroySwapchainKHR(device,swapChain,nullptr);
+
         vkDestroyDevice(device,nullptr);//销毁逻辑设备对象--3
         if(enableValidationLayers){
             //调用代理销毁VkDebugUtilsMessengerEXT对象--1
@@ -1714,6 +1748,54 @@ private:
         }
 
         return details;
+    }
+    //重建交换链
+    void recreateSwapChain(){
+        //设置应用程序在窗口最小化后停止渲染，直到窗口重新可见时重建交换链
+        int width=0,height = 0;
+        while(width == 0 || height == 0){
+            glfwGetFramebufferSize(window,&width,&height);
+            glfwWaitEvents();
+        }
+        //等待设备处于空闲状态，避免在对象的使用过程中将其清除重建
+        vkDeviceWaitIdle(device);
+
+        cleanupSwapChain();//清除交换链相关
+
+        //重新创建了交换链
+        createSwapChain();
+        //图形视图是直接依赖于交换链图像的，所以也需要被重建
+        createImageViews();
+        //渲染流程依赖于交换链图像的格式,窗口大小改变不会引起使用的交换链图像格式改变
+        createRenderPass();
+        //视口和裁剪矩形在管线创建时被指定，窗口大小改变，这些设置也需要修改
+        //我们可以通过使用动态状态来设置视口和裁剪矩形来避免重建管线
+        createGraphicsPipeline();
+        //帧缓冲和指令缓冲直接依赖于交换链图像
+        createFramebuffers();
+        createCommandBuffers();
+    }
+    //清除交换链相关
+    void cleanupSwapChain(){
+        //销毁帧缓冲对象
+        for(auto framebuffer : swapChainFramebuffers){
+            vkDestroyFramebuffer(device,framebuffer,nullptr);
+        }
+        //清除分配的指令缓冲对象
+        vkFreeCommandBuffers(device,commandPool ,
+           static_cast<uint32_t>(commandBuffers.size()),commandBuffers.data());
+        //销毁管线对象
+        vkDestroyPipeline ( device , graphicsPipeline , nullptr );
+        //销毁管线布局对象
+        vkDestroyPipelineLayout ( device , pipelineLayout , nullptr);
+        //销毁渲染流程对象
+        vkDestroyRenderPass ( device , renderPass , nullptr );
+        //销毁图像视图
+        for(auto imageView : swapChainImageViews){
+            vkDestroyImageView(device,imageView,nullptr);
+        }
+        //销毁交换链对象，在逻辑设备被清除前调用
+        vkDestroySwapchainKHR(device,swapChain,nullptr);
     }
 };
 
