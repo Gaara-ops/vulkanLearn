@@ -9,6 +9,43 @@
 #include <cstdlib>//用来使用 EXITSUCCESS 和 EXIT_FAILURE 宏
 #include <set> //使用集合
 #include <fstream>//读取文件
+#include <glm/glm.hpp>//线性代数库
+//顶点结构体
+struct Vertex{
+    glm::vec2 pos;
+    glm::vec3 color;
+    //返回 Vertex 结构体的顶点数据存放方式
+    static VkVertexInputBindingDescription getBindingDescription() {
+        VkVertexInputBindingDescription bindingDescription = {};
+        bindingDescription.binding = 0;
+        bindingDescription.stride = sizeof(Vertex);
+        bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        return bindingDescription;
+    }
+
+    static std::array<VkVertexInputAttributeDescription, 2>
+                                getAttributeDescriptions() {
+        std::array<VkVertexInputAttributeDescription,2> attributeDescriptions=
+                {};
+        attributeDescriptions[0].binding = 0;
+        attributeDescriptions[0].location = 0;
+        attributeDescriptions[0].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[0].offset = offsetof(Vertex, pos);
+
+        attributeDescriptions[1].binding = 0;
+        attributeDescriptions[1].location = 1;
+        attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attributeDescriptions[1].offset = offsetof(Vertex, color);
+
+        return attributeDescriptions;
+    }
+};
+//定义顶点数据--交叉顶点属性 (interleaving vertex attributes)。
+const std::vector<Vertex> vertices = {
+    {{0.0f ,-0.5f} , {1.0f , 0.0f , 0.0f}} ,
+    {{0.5f , 0.5f} , {0.0f , 1.0f , 0.0f}} ,
+    {{-0.5f , 0.5f} , {0.0f , 0.0f , 1.0f}}
+};
 
 //可以同时并行处理的帧数--12
 const int MAX_FRAMES_IN_FLIGHT = 2;
@@ -125,6 +162,9 @@ private:
 
     //标记窗口大小是否发生改变：
     bool framebufferResized = false;
+
+    VkBuffer vertexBuffer;//存储创建的顶点缓冲的句柄
+    VkDeviceMemory vertexBufferMemory ;//顶点缓冲的内存句柄
 
     //为静态函数才能将其用作回调函数
     static void framebufferResizeCallback(GLFWwindow* window,int width ,
@@ -771,6 +811,9 @@ private:
             vertShaderStageInfo , fragShaderStageInfo
         };
 
+        auto bindingDescription = Vertex::getBindingDescription();
+        auto attributeDescriptions = Vertex::getAttributeDescriptions();
+
         /**
           描述内容主要包括下面两个方面：
         绑定：数据之间的间距和数据是按逐顶点的方式还是按逐实例的方式进行组织
@@ -781,11 +824,13 @@ private:
         VkPipelineVertexInputStateCreateInfo vertexInputInfo = {};
         vertexInputInfo.sType =
                 VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vertexInputInfo.vertexBindingDescriptionCount=0;
+        vertexInputInfo.vertexBindingDescriptionCount=1;
         //用于指向描述顶点数据组织信息地结构体数组
-        vertexInputInfo.pVertexBindingDescriptions=nullptr;
-        vertexInputInfo.vertexAttributeDescriptionCount = 0;
-        vertexInputInfo.pVertexAttributeDescriptions = nullptr;
+        vertexInputInfo.pVertexBindingDescriptions=&bindingDescription;
+        vertexInputInfo.vertexAttributeDescriptionCount =
+                static_cast<uint32_t>(attributeDescriptions.size());
+        vertexInputInfo.pVertexAttributeDescriptions =
+                attributeDescriptions.data();;
         /**
         VkPipelineInputAssemblyStateCreateInfo 结构体用于描述两个信息：
         1.顶点数据定义了哪种类型的几何图元,通过 topology 成员变量指定：如下值
@@ -1317,17 +1362,26 @@ private:
             /**
             至此，我们已经提交了需要图形管线执行的指令，以及片段着色器使用的附着
             */
+            VkBuffer vertexBuffers[] = { vertexBuffer };
+            VkDeviceSize offset[] = {0};
+            /**
+            vkCmdBindVertexBuffers第二,三个参数指定偏移值和我们要绑定的顶点缓冲的数量。
+            最后两个参数用于指定需要绑定的顶点缓冲数组以及顶点数据在顶点缓冲中的偏移值数组
+              */
+            //绑定顶点缓冲
+            vkCmdBindVertexBuffers(commandBuffers[i],0,1,vertexBuffers,offset);
             /**
               vkCmdDraw参数：
               1.记录有要执行的指令的指令缓冲对象
-              2. vertexCount：
+              2. vertexCount：顶点缓冲中的顶点个数
                 尽管这里我们没有使用顶点缓冲，但仍然需要指定三个顶点用于三角形的绘制。
               3.instanceCount：用于实例渲染，为 1 时表示不进行实例渲染
               4.firstVertex：用于定义着色器变量 gl_VertexIndex 的值
               5.firstInstance：用于定义着色器变量 gl_InstanceIndex 的值
               */
             //开始调用指令进行三角形的绘制操作
-            vkCmdDraw( commandBuffers [ i ] , 3 , 1 , 0 , 0) ;
+            vkCmdDraw( commandBuffers [ i ] ,
+                       static_cast<uint32_t>(vertices.size()) , 1 , 0 , 0) ;
             //结束渲染流程
             vkCmdEndRenderPass( commandBuffers [ i ] ) ;
             //结束记录指令到指令缓冲
@@ -1385,6 +1439,7 @@ private:
         createGraphicsPipeline();//创建图形管线
         createFramebuffers();
         createCommandPool();//创建指令池
+        createVertexBuffer();//创建顶点缓冲
         createCommandBuffers();
         createSyncObjects();
     }
@@ -1563,6 +1618,10 @@ private:
     //清理资源
     void cleanup(){
         cleanupSwapChain();//释放交换链相关
+        //销毁顶点缓冲
+        vkDestroyBuffer(device,vertexBuffer,nullptr);
+        //释放顶点缓冲缓冲的内存
+        vkFreeMemory(device,vertexBufferMemory,nullptr);
 
         //清除为每一帧创建的信号量和VkFence 对象--12
         for(size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++){
@@ -1796,6 +1855,116 @@ private:
         }
         //销毁交换链对象，在逻辑设备被清除前调用
         vkDestroySwapchainKHR(device,swapChain,nullptr);
+    }
+    //创建顶点缓冲
+    void createVertexBuffer(){
+        VkBufferCreateInfo bufferInfo = {};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        //指定要创建的缓冲所占字节大小
+        bufferInfo.size = sizeof(vertices[0])* vertices.size();
+        //指定缓冲中的数据的使用目的--这里存储顶点数据
+        bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        //和交换链图像一样，缓冲可以被特定的队列族所拥有，也可以同时在多个队列族之前共享
+        //这里使用独有模式
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        //于配置缓冲的内存稀疏程度
+        bufferInfo.flags = 0;
+        if(vkCreateBuffer(device,&bufferInfo,nullptr,
+                          &vertexBuffer) != VK_SUCCESS){
+            throw std::runtime_error("failed to create vertex buffer!");
+        }
+        /**
+        vkGetBufferMemoryRequirements 函数返回的 VkMemoryRequirements
+        结构体有下面这三个成员变量：
+        size：缓冲需要的内存的字节大小，它可能和 bufferInfo.size 的值不同
+        alignment：缓冲在实际被分配的内存中的开始位置。
+                它的值依赖于bufferInfo.usage 和 bufferInfo.flags。
+        memoryTypeBIts：指示适合该缓冲使用的内存类型的位域
+          */
+        //获取缓冲的内存需求
+        VkMemoryRequirements memRequirements ;
+        vkGetBufferMemoryRequirements(device,vertexBuffer,&memRequirements);
+
+        VkMemoryAllocateInfo allocInfo = {};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        //内存大小
+        allocInfo.allocationSize = memRequirements.size;
+        /**
+        我们需要位域满足 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT(用于从 CPU 写入数据)
+        和 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT的内存类型
+          */
+        allocInfo.memoryTypeIndex = findMemoryType(
+                    memRequirements.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        //分配内存
+        if(vkAllocateMemory(device,&allocInfo,nullptr,
+                            &vertexBufferMemory)!=VK_SUCCESS){
+            throw std::runtime_error("failed to allocate vertex buffer memory!");
+        }
+        /**
+        第四个参数是偏移值。这里我们将内存用作顶点缓冲，可以将其设置为 0。
+        偏移值需要满足能够被 memRequirements.alignment 整除
+          */
+        //将分配的内存和缓冲对象进行关联
+        vkBindBufferMemory(device,vertexBuffer,vertexBufferMemory,0);
+        //将顶点数据复制到缓冲中
+        void* data;
+        /**
+        vkMapMemory 函数允许我们通过给定的内存偏移值和内存大小访问特定的内存资源。
+        这里我们使用的偏移值和内存大小分别时 0 和 bufferInfo.size。
+        还有一个特殊值 VK_WHOLE_SIZE 可以用来映射整个申请的内存。
+        vkMapMemory 函数的倒数第二个参数可以用来指定一个标记，暂不可用,必须将其设置为 0。
+        最后一个参数用于返回内存映射后的地址。
+          */
+        //vkMapMemory将缓冲关联的内存映射到 CPU 可以访问的内存
+        vkMapMemory(device,vertexBufferMemory,0,bufferInfo.size,0,&data);
+        /**
+        驱动程序可能并不会立即复制数据到缓冲关联的内存中去，
+        这是由于现代处理器都存在缓存这一设计，写入内存的数据并不一定在多个核心同时可见，
+        有下面两种方法可以保证数据被立即复制到缓冲关联的内存中去:
+        1.使用带有VK_MEMORY_PROPERTY_HOST_COHERENT_BIT属性的内存类型,
+          保证内存可见的一致性
+        2.写入数据到映射的内存后，调用 vkFlushMappedMemoryRanges 函数，
+          读取映射的内存数据前调用 vkInvalidateMappedMemoryRanges函数
+
+        第一种方法，它可以保证映射的内存的内容和缓冲关联的内存的内容一致。
+        但使用这种方式，会比第二种方式些许降低性能表现
+          */
+        //将顶点数据复制到映射后的内存
+        memcpy(data,vertices.data(),(size_t)bufferInfo.size);
+        //结束内存映射
+        vkUnmapMemory(device,vertexBufferMemory);
+    }
+    /**
+     * @brief findMemoryType
+     * @param typeFilter -- 指定我们需要的内存类型的位域
+     * @param properties
+     *  显卡可以分配不同类型的内存作为缓冲使用。不同类型的内存所允许进行的操作以及
+        操作的效率有所不同。我们需要结合自己的需求选择最合适的内存类型使用
+     */
+    //选择最合适的内存类型使用
+    uint32_t findMemoryType(uint32_t typeFilter,
+                            VkMemoryPropertyFlags properties){
+        /**
+        vkGetPhysicalDeviceMemoryProperties 函数返回的
+        VkPhysicalDeviceMemoryProperties结构体包含了memoryTypes和memoryHeaps变量。
+        memoryHeaps 数组成员变量中的每个元素是一种内存来源，比如显存以及
+                    显存用尽后的位于主内存种的交换空间
+          */
+        //查询物理设备可用的内存类型
+        VkPhysicalDeviceMemoryProperties memProperties ;
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice ,&memProperties);
+        //遍历数组，查找缓冲可用的内存类型
+        for(uint32_t i=0;i<memProperties.memoryTypeCount;i++){
+            //检测它是否与我们需要的属性的位域完全相同
+            if((typeFilter & (1 << i )) &&
+               (memProperties.memoryTypes[i].propertyFlags & properties) ==
+                    properties){
+                return i;
+            }
+        }
+        throw std::runtime_error("failed to find a suitable memory type!");
     }
 };
 
