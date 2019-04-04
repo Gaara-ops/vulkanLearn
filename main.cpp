@@ -1858,56 +1858,19 @@ private:
     }
     //创建顶点缓冲
     void createVertexBuffer(){
-        VkBufferCreateInfo bufferInfo = {};
-        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        //指定要创建的缓冲所占字节大小
-        bufferInfo.size = sizeof(vertices[0])* vertices.size();
-        //指定缓冲中的数据的使用目的--这里存储顶点数据
-        bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-        //和交换链图像一样，缓冲可以被特定的队列族所拥有，也可以同时在多个队列族之前共享
-        //这里使用独有模式
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        //于配置缓冲的内存稀疏程度
-        bufferInfo.flags = 0;
-        if(vkCreateBuffer(device,&bufferInfo,nullptr,
-                          &vertexBuffer) != VK_SUCCESS){
-            throw std::runtime_error("failed to create vertex buffer!");
-        }
+        VkDeviceSize bufferSize = sizeof(vertices[0])*vertices.size();
+        //使用 CPU 可见的缓冲作为临时缓冲，使用显卡读取较快的缓冲作为真正的顶点缓冲
+        VkBuffer stagingBuffer ;//缓冲对象存放 CPU 加载的顶点数据
+        VkDeviceMemory stagingBufferMemory ;//缓冲对象内存
         /**
-        vkGetBufferMemoryRequirements 函数返回的 VkMemoryRequirements
-        结构体有下面这三个成员变量：
-        size：缓冲需要的内存的字节大小，它可能和 bufferInfo.size 的值不同
-        alignment：缓冲在实际被分配的内存中的开始位置。
-                它的值依赖于bufferInfo.usage 和 bufferInfo.flags。
-        memoryTypeBIts：指示适合该缓冲使用的内存类型的位域
-          */
-        //获取缓冲的内存需求
-        VkMemoryRequirements memRequirements ;
-        vkGetBufferMemoryRequirements(device,vertexBuffer,&memRequirements);
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT：缓冲可以被用作内存传输操作的数据来源。
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT：缓冲可以被用作内存传输操作的目的缓冲
+         */
+        createBuffer(bufferSize,VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     stagingBuffer,stagingBufferMemory);
 
-        VkMemoryAllocateInfo allocInfo = {};
-        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        //内存大小
-        allocInfo.allocationSize = memRequirements.size;
-        /**
-        我们需要位域满足 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT(用于从 CPU 写入数据)
-        和 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT的内存类型
-          */
-        allocInfo.memoryTypeIndex = findMemoryType(
-                    memRequirements.memoryTypeBits,
-                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        //分配内存
-        if(vkAllocateMemory(device,&allocInfo,nullptr,
-                            &vertexBufferMemory)!=VK_SUCCESS){
-            throw std::runtime_error("failed to allocate vertex buffer memory!");
-        }
-        /**
-        第四个参数是偏移值。这里我们将内存用作顶点缓冲，可以将其设置为 0。
-        偏移值需要满足能够被 memRequirements.alignment 整除
-          */
-        //将分配的内存和缓冲对象进行关联
-        vkBindBufferMemory(device,vertexBuffer,vertexBufferMemory,0);
         //将顶点数据复制到缓冲中
         void* data;
         /**
@@ -1918,7 +1881,7 @@ private:
         最后一个参数用于返回内存映射后的地址。
           */
         //vkMapMemory将缓冲关联的内存映射到 CPU 可以访问的内存
-        vkMapMemory(device,vertexBufferMemory,0,bufferInfo.size,0,&data);
+        vkMapMemory(device,stagingBufferMemory,0,bufferSize,0,&data);
         /**
         驱动程序可能并不会立即复制数据到缓冲关联的内存中去，
         这是由于现代处理器都存在缓存这一设计，写入内存的数据并不一定在多个核心同时可见，
@@ -1932,9 +1895,23 @@ private:
         但使用这种方式，会比第二种方式些许降低性能表现
           */
         //将顶点数据复制到映射后的内存
-        memcpy(data,vertices.data(),(size_t)bufferInfo.size);
+        memcpy(data,vertices.data(),(size_t)bufferSize);
         //结束内存映射
-        vkUnmapMemory(device,vertexBufferMemory);
+        vkUnmapMemory(device,stagingBufferMemory);
+
+        createBuffer(bufferSize,VK_BUFFER_USAGE_TRANSFER_DST_BIT|
+                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                     vertexBuffer,vertexBufferMemory);
+        /**
+        vertexBuffer 现在关联的内存是设备所有的，不能 vkMapMemory 函数
+        对它关联的内存进行映射。我们只能通过 stagingBuffer 来向 vertexBuffer复制数据。
+        我们需要使用标记指明我们使用缓冲进行传输操作.
+          */
+        copyBuffer(stagingBuffer , vertexBuffer , bufferSize ) ;
+        //清除我们使用的缓冲对象和它关联的内存对象
+        vkDestroyBuffer(device , stagingBuffer , nullptr ) ;
+        vkFreeMemory(device , stagingBufferMemory , nullptr ) ;
     }
     /**
      * @brief findMemoryType
@@ -1965,6 +1942,119 @@ private:
             }
         }
         throw std::runtime_error("failed to find a suitable memory type!");
+    }
+    //创建缓冲--方便地使用不同的缓冲大小，内存类型来创建我们需要的缓冲
+    //最后两个参数用于返回创建的缓冲对象和它关联的内存对象
+    void createBuffer(VkDeviceSize size,VkBufferUsageFlags usage,
+                      VkMemoryPropertyFlags properties , VkBuffer& buffer,
+                      VkDeviceMemory& bufferMemory){
+        //同createVertexBuffer基本相同
+        VkBufferCreateInfo bufferInfo = {};
+        bufferInfo.sType =  VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        //指定要创建的缓冲所占字节大小
+        bufferInfo.size = size;
+        //指定缓冲中的数据的使用目的--这里存储顶点数据
+        bufferInfo.usage = usage;
+        //和交换链图像一样，缓冲可以被特定的队列族所拥有，也可以同时在多个队列族之前共享
+        //这里使用独有模式
+        bufferInfo.sharingMode =  VK_SHARING_MODE_EXCLUSIVE;
+        //配置缓冲的内存稀疏程度
+        bufferInfo.flags = 0;
+        if(vkCreateBuffer(device,&bufferInfo,nullptr,
+                          &buffer) != VK_SUCCESS){
+            throw std::runtime_error("failed to create buffer!");
+        }
+        /**
+        vkGetBufferMemoryRequirements 函数返回的 VkMemoryRequirements
+        结构体有下面这三个成员变量：
+        size：缓冲需要的内存的字节大小，它可能和 bufferInfo.size 的值不同
+        alignment：缓冲在实际被分配的内存中的开始位置。
+                它的值依赖于bufferInfo.usage 和 bufferInfo.flags。
+        memoryTypeBIts：指示适合该缓冲使用的内存类型的位域
+          */
+        //获取缓冲的内存需求
+        VkMemoryRequirements memRequirements ;
+        vkGetBufferMemoryRequirements(device,buffer,&memRequirements);
+
+        VkMemoryAllocateInfo allocInfo = {};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memRequirements.size;//内存大小
+        /**
+        我们需要位域满足 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT(用于从 CPU 写入数据)
+        和 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT的内存类型
+          */
+        allocInfo.memoryTypeIndex = findMemoryType(
+                    memRequirements.memoryTypeBits,properties);
+        //分配内存
+        if(vkAllocateMemory(device,&allocInfo,nullptr,
+                            &bufferMemory)!=VK_SUCCESS){
+            throw std::runtime_error("failed to allocate buffer memory!");
+        }
+        /**
+        第四个参数是偏移值。这里我们将内存用作顶点缓冲，可以将其设置为 0。
+        偏移值需要满足能够被 memRequirements.alignment 整除
+          */
+        //将分配的内存和缓冲对象进行关联
+        vkBindBufferMemory(device,buffer,bufferMemory,0);
+    }
+    //用于在缓冲之间复制数据
+    void copyBuffer( VkBuffer srcBuffer , VkBuffer dstBuffer,
+                      VkDeviceSize size){
+        /**
+        我们需要一个支持内存传输指令的指令缓冲来记录内存传输指令，
+        然后提交到内存传输指令队列执行内存传输。
+        通常，我们会为内存传输指令使用的指令缓冲创建另外的指令池对象，
+        这是因为内存传输指令的指令缓存通常生命周期很短，为它们使用独立的指令池对象，
+        可以进行更好的优化。
+        我们可以在创建指令池对象时为它指定VK_COMMAND_POOL_CREATE_TRANSIENT_BIT标记.
+          */
+        VkCommandBufferAllocateInfo allocInfo = {};
+        allocInfo.sType =
+                VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.commandPool = commandPool;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandBufferCount = 1;
+        //分配指令缓冲对象
+        VkCommandBuffer commandBuffer;
+        if(vkAllocateCommandBuffers(device,&allocInfo,
+                                    &commandBuffer)!= VK_SUCCESS){
+            throw std::runtime_error("failed to allocate buffers!");
+        }
+        //开始记录内存传输指令
+        VkCommandBufferBeginInfo beginInfo = {};
+        beginInfo.sType =
+                VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        //flags告诉驱动程序我们如何使用这个指令缓冲，来让驱动程序进行更好的优化
+        beginInfo.flags =
+                VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if(vkBeginCommandBuffer(commandBuffer,&beginInfo)!=VK_SUCCESS){
+            throw std::runtime_error(
+                        "failed to begin recording command buffer.");
+        }
+        //指定了复制操作的源缓冲位置偏移，目的缓冲位置偏移，以及要复制的数据长度
+        VkBufferCopy copyRegion = {};
+        copyRegion.srcOffset = 0;
+        copyRegion.dstOffset = 0;
+        copyRegion.size = size;//指定要复制的数据长度
+        //进行缓冲的复制
+        vkCmdCopyBuffer(commandBuffer,srcBuffer,dstBuffer,1,&copyRegion);
+        //结束指令缓冲的记录操作，提交指令缓冲完成传输操作的执行
+        vkEndCommandBuffer( commandBuffer ) ;
+        VkSubmitInfo submitInfo = {};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+
+        vkQueueSubmit( graphicsQueue , 1 , &submitInfo , VK_NULL_HANDLE) ;
+        /**
+        有两种等待内存传输操作完成的方法：
+        1.一种是使用栅栏 (fence)，通过 vkWaitForFences函数等待。
+        2.通过 vkQueueWaitIdle 函数等待。
+        使用栅栏 (fence) 可以同步多个不同的内存传输操作，给驱动程序的优化空间也更大
+         */
+        vkQueueWaitIdle( graphicsQueue ) ;//等待传输操作完成
+        //清除我们使用的指令缓冲对象
+        vkFreeCommandBuffers( device ,commandPool ,1 ,&commandBuffer);
     }
 };
 
