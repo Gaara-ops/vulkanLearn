@@ -42,9 +42,14 @@ struct Vertex{
 };
 //定义顶点数据--交叉顶点属性 (interleaving vertex attributes)。
 const std::vector<Vertex> vertices = {
-    {{0.0f ,-0.5f} , {1.0f , 0.0f , 0.0f}} ,
-    {{0.5f , 0.5f} , {0.0f , 1.0f , 0.0f}} ,
-    {{-0.5f , 0.5f} , {0.0f , 0.0f , 1.0f}}
+    {{-0.5f ,-0.5f} , {1.0f , 0.0f , 0.0f}} ,
+    {{0.5f , -0.5f} , {0.0f , 1.0f , 0.0f}} ,
+    {{0.5f , 0.5f} , {0.0f , 0.0f , 1.0f}} ,
+    {{-0.5f , 0.5f} , {1.0f , 1.0f , 1.0f}}
+};
+//定义索引数据
+const std::vector<uint16_t> indices = {
+    0,1,2,2,3,0
 };
 
 //可以同时并行处理的帧数--12
@@ -165,6 +170,9 @@ private:
 
     VkBuffer vertexBuffer;//存储创建的顶点缓冲的句柄
     VkDeviceMemory vertexBufferMemory ;//顶点缓冲的内存句柄
+
+    VkBuffer indexBuffer ;//存储创建的索引缓冲的句柄
+    VkDeviceMemory indexBufferMemory ;//索引缓冲的内存句柄
 
     //为静态函数才能将其用作回调函数
     static void framebufferResizeCallback(GLFWwindow* window,int width ,
@@ -1370,6 +1378,15 @@ private:
               */
             //绑定顶点缓冲
             vkCmdBindVertexBuffers(commandBuffers[i],0,1,vertexBuffers,offset);
+
+            /**
+              只能绑定一个索引缓冲对象.
+            我们不能为每个顶点属性使用不同的索引，所以即使只有一个顶点属性不同，
+            也要在顶点缓冲中多出一个顶点的数据
+              */
+            //绑定顶点缓冲到指令缓冲对象--第三个参数为索引数据的类型
+            vkCmdBindIndexBuffer(commandBuffers[i],indexBuffer,0,
+                                 VK_INDEX_TYPE_UINT16);
             /**
               vkCmdDraw参数：
               1.记录有要执行的指令的指令缓冲对象
@@ -1379,9 +1396,22 @@ private:
               4.firstVertex：用于定义着色器变量 gl_VertexIndex 的值
               5.firstInstance：用于定义着色器变量 gl_InstanceIndex 的值
               */
-            //开始调用指令进行三角形的绘制操作
-            vkCmdDraw( commandBuffers [ i ] ,
-                       static_cast<uint32_t>(vertices.size()) , 1 , 0 , 0) ;
+            //开始调用指令进行三角形的绘制操作--使用顶点绘制
+            /*vkCmdDraw( commandBuffers [ i ] ,
+                       static_cast<uint32_t>(vertices.size()) , 1 , 0 , 0);*/
+            /**
+              vkCmdDrawIndexed参数：
+              1.指令缓冲对象
+              2.指定索引的个数
+              3.实例的个数 -- 这里没有使用实例渲染，所以将实例个数设置为 1
+              4.偏移值用于指定显卡开始读取索引的位置,偏移值为1对应索引数据中的第二个索引。
+              5.检索顶点数据前加到顶点索引上的数值
+              6.第一个被渲染的实例的 ID -- 这里没有使用
+              */
+            //使用索引绘制
+            vkCmdDrawIndexed(commandBuffers[i],
+                       static_cast<uint32_t>(indices.size()),1,0,0,0);
+
             //结束渲染流程
             vkCmdEndRenderPass( commandBuffers [ i ] ) ;
             //结束记录指令到指令缓冲
@@ -1440,6 +1470,7 @@ private:
         createFramebuffers();
         createCommandPool();//创建指令池
         createVertexBuffer();//创建顶点缓冲
+        createIndexBuffer();//创建索引缓冲
         createCommandBuffers();
         createSyncObjects();
     }
@@ -1622,6 +1653,10 @@ private:
         vkDestroyBuffer(device,vertexBuffer,nullptr);
         //释放顶点缓冲缓冲的内存
         vkFreeMemory(device,vertexBufferMemory,nullptr);
+        //销毁索引缓冲
+        vkDestroyBuffer(device,indexBuffer,nullptr);
+        //释放索引缓冲缓冲的内存
+        vkFreeMemory(device,indexBufferMemory,nullptr);
 
         //清除为每一帧创建的信号量和VkFence 对象--12
         for(size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++){
@@ -2055,6 +2090,33 @@ private:
         vkQueueWaitIdle( graphicsQueue ) ;//等待传输操作完成
         //清除我们使用的指令缓冲对象
         vkFreeCommandBuffers( device ,commandPool ,1 ,&commandBuffer);
+    }
+    //创建索引缓冲--同创建顶点缓冲方式相同
+    void createIndexBuffer(){
+        VkDeviceSize bufferSize = sizeof(indices[0])*indices.size();
+        VkBuffer stagingBuffer ;//缓冲对象存放 CPU 加载的数据
+        VkDeviceMemory stagingBufferMemory ;//缓冲对象内存
+        createBuffer(bufferSize,VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     stagingBuffer,stagingBufferMemory);
+
+        //将顶点数据复制到缓冲中
+        void* data;
+        vkMapMemory(device,stagingBufferMemory,0,bufferSize,0,&data);
+        memcpy(data,indices.data(),(size_t)bufferSize);
+        //结束内存映射
+        vkUnmapMemory(device,stagingBufferMemory);
+
+        createBuffer(bufferSize,VK_BUFFER_USAGE_TRANSFER_DST_BIT|
+                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                     indexBuffer,indexBufferMemory);
+
+        copyBuffer(stagingBuffer , indexBuffer , bufferSize ) ;
+
+        vkDestroyBuffer(device , stagingBuffer , nullptr ) ;
+        vkFreeMemory(device , stagingBufferMemory , nullptr ) ;
     }
 };
 
