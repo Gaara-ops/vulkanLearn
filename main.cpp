@@ -15,6 +15,12 @@
 #include <glm/gtc/matrix_transform.hpp>
 //为了使用计时函数,我们将通过计时函数实现每秒旋转 90 度的效果
 #include <chrono>
+/**
+默认情况下stb_image.h文件只定义了函数原型，我们需要在包含tb_image.h 文件前
+定义 STB_IMAGE_IMPLEMENTATION 宏，来让它将函数实现包含进来。
+  */
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
 //顶点结构体
 struct Vertex{
     glm::vec2 pos;
@@ -194,6 +200,13 @@ private:
     std::vector<VkDeviceMemory> uniformBuffersMemory;//uniform缓冲对象的内存句柄
     VkDescriptorPool descriptorPool ;//描述符池对象
     std::vector<VkDescriptorSet> descriptorSets;//描述符集对象集合,自动清除
+    /**
+    尽管，我们可以在着色器直接访问缓冲中的像素数据，但使用 Vulkan的图像对象会更好。
+    Vulkan 的图像对象允许我们使用二维坐标来快速获取颜色数据。
+    图像对象的像素数据也被叫做纹素
+     */
+    VkImage textureImage ;//纹理图像
+    VkDeviceMemory textureImageMemory ;//纹理图像对象的内存
 
     //为静态函数才能将其用作回调函数
     static void framebufferResizeCallback(GLFWwindow* window,int width ,
@@ -1497,6 +1510,7 @@ private:
         createGraphicsPipeline();//创建图形管线
         createFramebuffers();
         createCommandPool();//创建指令池
+        createTextureImage();//加载图像数据到一个Vulkan 图像对象
         createVertexBuffer();//创建顶点缓冲
         createIndexBuffer();//创建索引缓冲
         createUniformBuffer();//创建uniform 缓冲对象
@@ -1682,6 +1696,10 @@ private:
     //清理资源
     void cleanup(){
         cleanupSwapChain();//释放交换链相关
+        //销毁纹理对象
+        vkDestroyImage(device,textureImage,nullptr);
+        //释放纹理对象内存
+        vkFreeMemory(device,textureImageMemory,nullptr);
         //销毁描述符池对象
         vkDestroyDescriptorPool(device,descriptorPool,nullptr);
         //销毁描述符对象
@@ -2077,37 +2095,8 @@ private:
     //用于在缓冲之间复制数据
     void copyBuffer( VkBuffer srcBuffer , VkBuffer dstBuffer,
                       VkDeviceSize size){
-        /**
-        我们需要一个支持内存传输指令的指令缓冲来记录内存传输指令，
-        然后提交到内存传输指令队列执行内存传输。
-        通常，我们会为内存传输指令使用的指令缓冲创建另外的指令池对象，
-        这是因为内存传输指令的指令缓存通常生命周期很短，为它们使用独立的指令池对象，
-        可以进行更好的优化。
-        我们可以在创建指令池对象时为它指定VK_COMMAND_POOL_CREATE_TRANSIENT_BIT标记.
-          */
-        VkCommandBufferAllocateInfo allocInfo = {};
-        allocInfo.sType =
-                VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        allocInfo.commandPool = commandPool;
-        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandBufferCount = 1;
-        //分配指令缓冲对象
-        VkCommandBuffer commandBuffer;
-        if(vkAllocateCommandBuffers(device,&allocInfo,
-                                    &commandBuffer)!= VK_SUCCESS){
-            throw std::runtime_error("failed to allocate buffers!");
-        }
-        //开始记录内存传输指令
-        VkCommandBufferBeginInfo beginInfo = {};
-        beginInfo.sType =
-                VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        //flags告诉驱动程序我们如何使用这个指令缓冲，来让驱动程序进行更好的优化
-        beginInfo.flags =
-                VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        if(vkBeginCommandBuffer(commandBuffer,&beginInfo)!=VK_SUCCESS){
-            throw std::runtime_error(
-                        "failed to begin recording command buffer.");
-        }
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
         //指定了复制操作的源缓冲位置偏移，目的缓冲位置偏移，以及要复制的数据长度
         VkBufferCopy copyRegion = {};
         copyRegion.srcOffset = 0;
@@ -2115,23 +2104,8 @@ private:
         copyRegion.size = size;//指定要复制的数据长度
         //进行缓冲的复制
         vkCmdCopyBuffer(commandBuffer,srcBuffer,dstBuffer,1,&copyRegion);
-        //结束指令缓冲的记录操作，提交指令缓冲完成传输操作的执行
-        vkEndCommandBuffer( commandBuffer ) ;
-        VkSubmitInfo submitInfo = {};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &commandBuffer;
 
-        vkQueueSubmit( graphicsQueue , 1 , &submitInfo , VK_NULL_HANDLE) ;
-        /**
-        有两种等待内存传输操作完成的方法：
-        1.一种是使用栅栏 (fence)，通过 vkWaitForFences函数等待。
-        2.通过 vkQueueWaitIdle 函数等待。
-        使用栅栏 (fence) 可以同步多个不同的内存传输操作，给驱动程序的优化空间也更大
-         */
-        vkQueueWaitIdle( graphicsQueue ) ;//等待传输操作完成
-        //清除我们使用的指令缓冲对象
-        vkFreeCommandBuffers( device ,commandPool ,1 ,&commandBuffer);
+        endSingleTimeCommands(commandBuffer) ;
     }
     //创建索引缓冲--同创建顶点缓冲方式相同
     void createIndexBuffer(){
@@ -2337,6 +2311,368 @@ private:
              */
             vkUpdateDescriptorSets(device,1,&descriptorWrite,0,nullptr);
         }
+    }
+    void copyBufferToImage(VkBuffer buffer , VkImage image ,
+                             uint32_t width , uint32_t height ){
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+        //指定将数据复制到图像的哪一部分
+        VkBufferImageCopy region = {};
+        //指定要复制的数据在缓冲中的偏移位置
+        region.bufferOffset = 0;
+        /**
+        bufferRowLength 和 bufferImageHeight 成员变量用于指定数据在内存中的存放方式.
+        通过这两个成员变量我们可以对每行图像数据使用额外的空间进行对齐。
+        将这两个成员变量的值都设置为 0，数据将会在内存中被紧凑存放
+          */
+        region.bufferRowLength = 0;
+        region.bufferImageHeight = 0;
+        //imageSubresource、imageOffset 和 imageExtent 成员变量用于指定
+        //数据被复制到图像的哪一部分
+        region.imageSubresource.aspectMask = ;
+        region.imageSubresource.mipLevel = 0;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+
+        region.imageOffset = {0,0,0};
+        region.imageExtent = {width,height};
+        /**
+        vkCmdCopyBufferToImage 函数的第 4 个参数用于指定目的图像当前使用的图像布局。
+        这里我们假设图像已经被变换为最适合作为复制目的的布局。
+        我们只复制了一张图像，实际上是可以指定一个 VkBufferImageCopy 数组来一次从
+        一个缓冲复制数据到多个不同的图像对象
+          */
+        //从缓冲复制数据到图像
+        vkCmdCopyBufferToImage(commandBuffer,buffer,image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&region);
+
+        endSingleTimeCommands( commandBuffer );
+    }
+
+    //加载图像数据到一个Vulkan 图像对象,用指令缓冲来完成加载
+    void createTextureImage(){
+        int texWidth , texHeight , texChannels ;
+        /**
+        以图像文件路径和需要加载的颜色通道作为参数来加载图像文件
+        使用 STBI_rgb_alpha 通道参数可以强制载入 alpha 通道，
+        即使图像数据不包含这一通道，也会被添加上一个默认的alpha值作为alpha
+        通道的图像数据，这为我们的处理带来了方便。
+        stbi_load 函数还可以返回图像的宽度，高度和图像数据实际存在的颜色通
+        道。stbi_load 函数的返回值是一个指向解析后的图像像素数据的指针。使
+        用 STBI_rgba_alpha 作为通道参数，每个像素需要 4 个字节存储，所有
+        像素按照行的方式依次存储.
+          */
+        stbi_uc* pixels = stbi_load(
+                    "E:/workspace/Qt5.6/VulkanLearn/textures/texture.jpg",
+                                   &texWidth,&texHeight,&texChannels,
+                                   STBI_rgb_alpha);
+        //图像需要的总字节数
+        VkDeviceSize imageSize = texWidth * texHeight * 4;
+        if(!pixels){
+            throw std::runtime_error("failed to load texture image!");
+        }
+
+        //同创建顶点缓冲步骤相同
+        //使用 CPU 可见的缓冲作为临时缓冲,才能映射内存
+        VkBuffer stagingBuffer ;
+        VkDeviceMemory stagingBufferMemory ;
+        createBuffer(imageSize,VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     stagingBuffer,stagingBufferMemory);
+
+        //映射内存，将图像数据复制到缓冲中：
+        void* data;
+        //vkMapMemory将缓冲关联的内存映射到 CPU 可以访问的内存
+        vkMapMemory(device,stagingBufferMemory,0,imageSize,0,&data);
+        //将顶点数据复制到映射后的内存
+        memcpy(data,pixels,static_cast<size_t>(imageSize));
+        //结束内存映射
+        vkUnmapMemory(device,stagingBufferMemory);
+        //清除图像像素数据
+        stbi_image_free( pixels) ;
+
+        createImage(texWidth,texHeight,VK_FORMAT_R8G8B8A8_UNORM,
+                    VK_IMAGE_TILING_OPTIMAL,
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                    textureImage,textureImageMemory);
+        /**
+        复制暂存缓冲中的数据到纹理图像，我们需要进行下面两步操作：
+        1. 变换纹理图像到 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+        2. 执行图像数据复制操作
+
+        这里我们创建的图像对象使用 VK_IMAGE_LAYOUT_UNDEFINED布局，
+        所以转换图像布局时应该将 VK_IMAGE_LAYOUT_UNDEFINED指定为旧布局。
+        需要注意的是我们之所以这样设置是因为我们不需要读取复制操作之前的图像内容。
+          */
+        transitionImageLayout(textureImage,VK_FORMAT_R8G8B8A8_UNORM,
+            VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        //为了能够在着色器中采样纹理图像数据,我们还需要进行一次图像布局变换
+        transitionImageLayout(textureImage,VK_FORMAT_R8G8B8A8_UNORM,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        /**
+          注意：如果在开启校验层的情况下运行程序，会发现校验层报告
+        transitionImageLayout 中使用的访问掩码和管线阶段是无效的。
+        我们需要根据布局变换设置 transitionImageLayout。我们需要处理两种变换：
+        1. 未定义 -> 传输目的：传输操作的数据写入不需要等待
+        2. 传输目的 -> 着色器读取：着色器读取图像数据需要等待传输操作的写入结束。
+          */
+
+        //清除我们使用的缓冲对象和它关联的内存对象
+        vkDestroyBuffer(device , stagingBuffer , nullptr ) ;
+        vkFreeMemory(device , stagingBufferMemory , nullptr ) ;
+    }
+    //创建图像
+    void createImage(uint32_t width , uint32_t height , VkFormat format ,
+                     VkImageTiling tiling , VkImageUsageFlags usage ,
+                     VkMemoryPropertyFlags properties , VkImage& image ,
+                     VkDeviceMemory& imageMemory){
+
+        VkImageCreateInfo imageInfo = {};
+        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        /**
+        图像类型可以是一维，二维和三维图像。一维图像通常被用来存储数组数据或梯度数据。
+        二维图像通常被用来存储纹理。三维图像通常被用类存储体素数据。
+          */
+        //指定图像类型,确定图像数据的坐标系
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        //extent指定图像在每个维度的范围，也就是在每个坐标轴有多少纹素
+        imageInfo.extent.width =  width;
+        imageInfo.extent.height = height;
+        imageInfo.extent.depth = 1;//二维为1
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        //图像数据格式,这里使用的是图像库解析的像素数据格式
+        imageInfo.format = format;
+        /**
+          tiling 成员变量可以是下面这两个值之一：
+          VK_IMAGE_TILING_LINEAR：纹素以行主序的方式排列
+          VK_IMAGE_TILING_OPTIMAL：纹素以一种对访问优化的方式排列
+
+        tiling 成员变量的设置在之后不可以修改。如果读者需要直接访问图
+        像数据，应该将 tiling 成员变量设置为 VK_IMAGE_TILING_LINEAR。
+
+        由于这里我们使用暂存缓冲而不是暂存图像来存储图像数据
+        所以设为后者来获得更好的访问性能.
+          */
+        imageInfo.tiling = tiling;
+        /**
+          initialLayout 成员变量可以设置为下面这些值:
+        VK_IMAGE_LAYOUT_UNDEFINED：GPU 不可用，纹素在第一次变换会被丢弃
+        VK_IMAGE_LAYOUT_PREINITIALIZED：GPU 不可用，纹素在第一次变换会被保留
+
+        大多数情况下对于第一次变换，纹素没有保留的必要。但如果使
+        用图像对象以及 VK_IMAGE_TILING_LINEAR 标记来暂存纹理数据，
+        这种情况下，纹理数据作为数据传输来源不会被丢弃。但在这里，我们
+        是将图像对象作为传输数据的接收方，将纹理数据从缓冲对象传输到图
+        像对象，所以我们不需要保留图像对象第一次变换时的纹理数据，使用
+        VK_IMAGE_LAYOUT_UNDEFINED 更好。
+          */
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        /**
+        usage 成员变量的用法和创建缓冲时使用的 usage 成员变量用法相同。
+        这里，我们创建的图像对象被用作传输数据的接收方。并且图像数据需要
+        被着色器采样，所以我们使用下面两个标记
+          */
+        imageInfo.usage = usage;
+        /**
+        我们的图像对象只被一个队列族使用：支持传输操作的队列族。
+        所以这里我们使用独占模式
+          */
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        /**
+        samples 成员变量用于设置多重采样。这一设置只对用作附着的图像对
+        象有效，我们的图像不用于附着，将其设置为采样 1 次。有许多用于稀疏
+        图像的优化标记可以使用。稀疏图像是一种离散存储图像数据的方法。比
+        如，我们可以使用稀疏图像来存储体素地形，避免为“空气”部分分配内存.
+          */
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        //没有使用 flags 标记,所以设为0
+        imageInfo.flags = 0;
+        //创建图像对象
+        if(vkCreateImage(device,&imageInfo,nullptr,
+                         &image)!=VK_SUCCESS){
+            throw std::runtime_error("failed to create image!");
+        }
+        //获取缓冲的内存需求
+        VkMemoryRequirements memRequirements ;
+        vkGetBufferMemoryRequirements(device,image,&memRequirements);
+
+        VkMemoryAllocateInfo allocInfo = {};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memRequirements.size;//内存大小
+        allocInfo.memoryTypeIndex = findMemoryType(
+                    memRequirements.memoryTypeBits,properties);
+        //分配内存
+        if(vkAllocateMemory(device,&allocInfo,nullptr,
+                            &imageMemory)!=VK_SUCCESS){
+            throw std::runtime_error("failed to allocate image memory!");
+        }
+        //将分配的内存和缓冲对象进行关联
+        vkBindBufferMemory(device,image,imageMemory,0);
+    }
+    //开始记录传输指令到指令缓冲
+    VkCommandBuffer beginSingleTimeCommands(){
+        /**
+        我们需要一个支持内存传输指令的指令缓冲来记录内存传输指令，
+        然后提交到内存传输指令队列执行内存传输。
+        通常，我们会为内存传输指令使用的指令缓冲创建另外的指令池对象，
+        这是因为内存传输指令的指令缓存通常生命周期很短，为它们使用独立的指令池对象，
+        可以进行更好的优化。
+        我们可以在创建指令池对象时为它指定VK_COMMAND_POOL_CREATE_TRANSIENT_BIT标记.
+          */
+        VkCommandBufferAllocateInfo allocInfo = {};
+        allocInfo.sType =
+                VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.commandPool = commandPool;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandBufferCount = 1;
+        //分配指令缓冲对象
+        VkCommandBuffer commandBuffer;
+        if(vkAllocateCommandBuffers(device,&allocInfo,
+                                    &commandBuffer)!= VK_SUCCESS){
+            throw std::runtime_error("failed to allocate command buffers!");
+        }
+        //开始记录内存传输指令
+        VkCommandBufferBeginInfo beginInfo = {};
+        beginInfo.sType =
+                VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        //flags告诉驱动程序我们如何使用这个指令缓冲，来让驱动程序进行更好的优化
+        beginInfo.flags =
+                VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if(vkBeginCommandBuffer(commandBuffer,&beginInfo)!=VK_SUCCESS){
+            throw std::runtime_error(
+                        "failed to begin recording command buffer.");
+        }
+    }
+    //结束记录传输指令到指令缓冲
+    void endSingleTimeCommands(VkCommandBuffer commandBuffer){
+        //结束指令缓冲的记录操作，提交指令缓冲完成传输操作的执行
+        vkEndCommandBuffer( commandBuffer ) ;
+        VkSubmitInfo submitInfo = {};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+
+        vkQueueSubmit( graphicsQueue , 1 , &submitInfo , VK_NULL_HANDLE) ;
+        /**
+         有两种等待内存传输操作完成的方法：
+         1.一种是使用栅栏 (fence)，通过 vkWaitForFences函数等待。
+         2.通过 vkQueueWaitIdle 函数等待。
+         使用栅栏 (fence) 可以同步多个不同的内存传输操作，给驱动程序的优化空间也更大
+          */
+        vkQueueWaitIdle( graphicsQueue ) ;//等待传输操作完成
+        //清除我们使用的指令缓冲对象
+        vkFreeCommandBuffers( device ,commandPool ,1 ,&commandBuffer);
+    }
+    /**
+    如果我们使用的是缓冲对象而不是图像对象，那么就可以记录传输指
+    令，然后调用 vkCmdCopyBufferToImage 函数结束工作，但这一指令需要
+    图像满足一定的布局要求，所以需要我们编写一个新的函数来进行图像布局变换
+      */
+    //变换图像布局
+    void transitionImageLayout(VkImage image, VkFormat format,
+                            VkImageLayout oldLayout,VkImageLayout newLayout){
+
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+        //对于缓冲对象也有一个可以实现同样效果的缓冲内存屏障 (buffer memory barrier)
+        VkImageMemoryBarrier barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        /**
+          指定布局变换
+        如果不需要访问之前的图像数据，可以将 oldLayout 设置为
+        VK_IMAGE_LAYOUT_UNDEFINED来获得更好的性能表现
+          */
+        barrier.oldLayout = oldLayout;
+        barrier.newLayout = newLayout;
+        /**
+        如果读者使用屏障来传递队列族所有权，那么就需要对 srcQueueFamilyIndex
+        和 dstQueueFamilyIndex 成员变量进行设置。如果读者不进行队列
+        所有权传递，则必须将这两个成员变量的值设置为 VK_QUEUE_FAMILY_IGNORED
+          */
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image;//指定进行布局变换的图像对象
+        //subresourceRange表示受影响的图像范围
+        barrier.subresourceRange.aspectMask = 0;
+        barrier.subresourceRange.baseMipLevel = 1;//不使用细分
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;//不使用细分
+        /**
+        我们需要指定在屏障之前必须发生的资源操作类型，以及必须等待屏
+        障的资源操作类型。虽然我们已经使用 vkQueueWaitIdle 函数来手动地进
+        行同步，但还是需要我们进行这一设置。但这一设置依赖旧布局和新布局，
+        所以我们会在确定使用的布局变换后再来设置它
+          */
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = 0;
+
+        /**
+        传输的写入操作必须在管线传输阶段进行。这里因为我们的写入
+        操作不需要等待任何对象，我们可以指定一个空的的访问掩码，使用
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT 指定最早出现的管线阶
+        段。需要注意 VK_PIPELINE_STAGE_TRANSFER_BIT 并非图形和计
+        算管线中真实存在的管线阶段，它实际上是一个伪阶段，出现在传输操作发生时.
+
+        图像数据需要在片段着色器读取，所以我们指定了片段着色器管线阶段的读取访问掩码。
+
+        指令缓冲的提交会隐式地进行 VK_ACCESS_HOST_WRITE_BIT
+        同步。因为 transitionImageLayout 函数执行的指令缓冲只包含了一条指
+        令，如果布局转换依赖 VK_ACCESS_HOST_WRITE_BIT，我们可以
+        通过设置 srcAccessMask 的值为 0 来使用这一隐含的同步。不过，我们最
+        好显式地定义一切，依赖于隐含属性，不就变得和 OpenGL 一样容易出现错误.
+
+        有一个特殊的支持所有操作的图像布局类型：VK_IMAGE_LAYOUT_GENERAL。
+        但它并不保证能为所有操作都带来最佳性能表现。对于一些特殊情况，比
+        如将图像同时用作输入和输出对象，或读取一个已经改变初始化时的布局的图像时，需要使用它。
+
+        目前为止，我们编写的包含提交指令操作的辅助函数都被设置为通过
+        等待队列空闲来进行同步。对于实用的程序，更推荐组合多个操作到一个
+        指令缓冲对象，通过异步执行来增大吞吐量，特别对于 createTextureImage
+        函数中的变换和数据复制操作，这样做可以获得很大的性能提升。我们可
+        以编写一个叫做 setupCommandBuffer 的辅助函数来记录指令，编写一个
+        叫做 flushSetupCommands 来提交执行记录的指令，通过实验得到最佳的同步策略
+          */
+        //根据布局变换设置
+        VkPipelineStageFlags sourceStage ;
+        VkPipelineStageFlags destinationStage ;
+        if(oldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+                newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL){
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        }else if(oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
+                 newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL){
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        }else{
+            throw std::invalid_argument("unsupported layout transition!");
+        }
+
+        /**
+          vkCmdPipelineBarrier参数：
+          1.指定发生在屏障之前的管线阶段
+          2.于指定发生在屏障之后的管线阶段，如果读者想要在一个屏障之后读取 uniform，
+          应该指定 VK_ACCESS_UNIFORM_READ_BIT使用标记和最早读取uniform的着色器阶段，
+          比如 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT。
+          当指定和使用标记不匹配的管线阶段时校验层会发出警告信息
+          3.设置为 0 或 VK_DEPENDENCY_BY_REGION_BIT。
+            设置为 VK_DEPENDENCY_BY_REGION_BIT 的话，屏障就变成了一个区域条件。
+            这允许我们读取资源目前已经写入的那部分
+          4-end:用于引用三种可用的管线屏障数组：内存屏障 (memory barriers)，
+        缓冲内存屏障 (buffer memory barriers) 和图像内存屏障 (imagememory barriers)。
+        我们这里使用的是图像内存屏障 (image memory barriers)。
+        需要注意这里我们没有使用 VkFormat 参数，但之后用它进行特殊的变换操作
+          */
+        //提交管线屏障对象
+        vkCmdPipelineBarrier(commandBuffer,sourceStage,destinationStage,
+                             0,0,nullptr,0,nullptr,1,&barrier);
+
+        endSingleTimeCommands( commandBuffer );
     }
 };
 
