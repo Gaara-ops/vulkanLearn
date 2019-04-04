@@ -9,7 +9,12 @@
 #include <cstdlib>//用来使用 EXITSUCCESS 和 EXIT_FAILURE 宏
 #include <set> //使用集合
 #include <fstream>//读取文件
+#define GLM_FORCE_RADIANS//用来使 glm::rotate这些函数使用弧度作为参数的单位
 #include <glm/glm.hpp>//线性代数库
+//为了使用glm::rotate之类的矩阵变换函数
+#include <glm/gtc/matrix_transform.hpp>
+//为了使用计时函数,我们将通过计时函数实现每秒旋转 90 度的效果
+#include <chrono>
 //顶点结构体
 struct Vertex{
     glm::vec2 pos;
@@ -50,6 +55,12 @@ const std::vector<Vertex> vertices = {
 //定义索引数据
 const std::vector<uint16_t> indices = {
     0,1,2,2,3,0
+};
+//着色器中使用的 uniform 数据
+struct UniformBufferObject{
+    alignas(16) glm::mat4 model;//模型矩阵
+    alignas(16) glm::mat4 view;//视图矩阵
+    alignas(16) glm::mat4 proj;//投影矩阵
 };
 
 //可以同时并行处理的帧数--12
@@ -139,6 +150,11 @@ private:
     std::vector<VkImageView> swapChainImageViews;
 
     VkRenderPass renderPass;//渲染流程对象--9
+    /**
+     * @brief descriptorSetLayout
+     * 描述符布局对象可以在应用程序的整个生命周期使用，即使使用了新的管线对象
+     */
+    VkDescriptorSetLayout descriptorSetLayout ;//描述符布局对象
     VkPipelineLayout pipelineLayout;//管线布局--9
     VkPipeline graphicsPipeline;//管线对象--9
 
@@ -173,6 +189,11 @@ private:
 
     VkBuffer indexBuffer ;//存储创建的索引缓冲的句柄
     VkDeviceMemory indexBufferMemory ;//索引缓冲的内存句柄
+
+    std::vector<VkBuffer> uniformBuffers;//uniform 缓冲对象集合
+    std::vector<VkDeviceMemory> uniformBuffersMemory;//uniform缓冲对象的内存句柄
+    VkDescriptorPool descriptorPool ;//描述符池对象
+    std::vector<VkDescriptorSet> descriptorSets;//描述符集对象集合,自动清除
 
     //为静态函数才能将其用作回调函数
     static void framebufferResizeCallback(GLFWwindow* window,int width ,
@@ -929,7 +950,8 @@ private:
         //指定使用的表面剔除类型.我们可以通过它禁用表面剔除,剔除背面,剔除正面,以及剔除双面
         rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
         //指定顺时针的顶点序是正面，还是逆时针的顶点序是正面
-        rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+        //VK_FRONT_FACE_CLOCKWISE;VK_FRONT_FACE_COUNTER_CLOCKWISE
+        rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         /**
         光栅化程序可以添加一个常量值或是一个基于片段所处线段的斜率得到的变量值到深度值上。
         这对于阴影贴图会很有用，这里我们不使用,so将depthBiasEnable设为false
@@ -1021,8 +1043,9 @@ private:
         VkPipelineLayoutCreateInfo pipelineLayoutInfo = {};
         pipelineLayoutInfo.sType =
                 VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pipelineLayoutInfo.setLayoutCount = 0;
-        pipelineLayoutInfo.pSetLayouts = nullptr;
+        //设置描述符布局
+        pipelineLayoutInfo.setLayoutCount = 1;
+        pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
         pipelineLayoutInfo.pushConstantRangeCount = 0;
         pipelineLayoutInfo.pPushConstantRanges = nullptr;
         //VkPipelineLayout 结构体指定可以在着色器中使用的常量值
@@ -1387,6 +1410,10 @@ private:
             //绑定顶点缓冲到指令缓冲对象--第三个参数为索引数据的类型
             vkCmdBindIndexBuffer(commandBuffers[i],indexBuffer,0,
                                  VK_INDEX_TYPE_UINT16);
+            //为每个交换链图像绑定对应的描述符集
+            vkCmdBindDescriptorSets(commandBuffers[i] ,
+                            VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            pipelineLayout,0,1,&descriptorSets[i],0,nullptr);
             /**
               vkCmdDraw参数：
               1.记录有要执行的指令的指令缓冲对象
@@ -1466,11 +1493,15 @@ private:
         createSwapChain();//创建交换链
         createImageViews();//为交换链中的每一个图像建立图像视图
         createRenderPass();
+        createDescriptorSetLayout();//提供着色器使用的每一个描述符绑定信息
         createGraphicsPipeline();//创建图形管线
         createFramebuffers();
         createCommandPool();//创建指令池
         createVertexBuffer();//创建顶点缓冲
         createIndexBuffer();//创建索引缓冲
+        createUniformBuffer();//创建uniform 缓冲对象
+        createDescriptorPool();//描述符池的创建
+        createDescriptorSets();//创建描述符集对象
         createCommandBuffers();
         createSyncObjects();
     }
@@ -1533,6 +1564,8 @@ private:
         }else if(result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR){
             throw std::runtime_error("failed to acquire swap chain image!");
         }
+
+        updateUniformBuffer(imageIndex);//更新 uniform 数据
 
         //提交信息给指令队列
         VkSubmitInfo submitInfo = {};
@@ -1649,6 +1682,15 @@ private:
     //清理资源
     void cleanup(){
         cleanupSwapChain();//释放交换链相关
+        //销毁描述符池对象
+        vkDestroyDescriptorPool(device,descriptorPool,nullptr);
+        //销毁描述符对象
+        vkDestroyDescriptorSetLayout(device,descriptorSetLayout,nullptr);
+        //释放uniform 缓冲对象
+        for(size_t i=0;i<swapChainImages.size();i++){
+            vkDestroyBuffer(device,uniformBuffers[i],nullptr);
+            vkFreeMemory(device,uniformBuffersMemory[i],nullptr);
+        }
         //销毁顶点缓冲
         vkDestroyBuffer(device,vertexBuffer,nullptr);
         //释放顶点缓冲缓冲的内存
@@ -2117,6 +2159,184 @@ private:
 
         vkDestroyBuffer(device , stagingBuffer , nullptr ) ;
         vkFreeMemory(device , stagingBufferMemory , nullptr ) ;
+    }
+    //提供着色器使用的每一个描述符绑定信息
+    void createDescriptorSetLayout(){
+        //描述每一个绑定
+        VkDescriptorSetLayoutBinding uboLayoutBinding = {};
+        //指定着色器使用的描述符绑定
+        uboLayoutBinding.binding = 0;
+        //描述符类型,这里指定的是一个 uniform 缓冲对象
+        //着色器变量可以用来表示 uniform 缓冲对象数组
+        uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        //数组中元素的个数
+        uboLayoutBinding.descriptorCount = 1;
+        //在哪一个着色器阶段被使用,这里只在顶点着色器使用
+        uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        //用于和图像采样相关的描述符
+        uboLayoutBinding.pImmutableSamplers = nullptr ;
+
+        //创建描述符布局相关信息
+        VkDescriptorSetLayoutCreateInfo layoutInfo = {};
+        layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layoutInfo.bindingCount = 1;
+        layoutInfo.pBindings = &uboLayoutBinding;
+        if(vkCreateDescriptorSetLayout(device,&layoutInfo,nullptr,
+                                       &descriptorSetLayout)!= VK_SUCCESS){
+            throw std::runtime_error("failed to create descriptor set layout");
+        }
+    }
+    //分配uniform 缓冲对象
+    void createUniformBuffer(){
+        VkDeviceSize buffersize = sizeof(UniformBufferObject);
+        uniformBuffers.resize(swapChainImages.size());
+        uniformBuffersMemory.resize(swapChainImages.size());
+        for(size_t i=0;i<swapChainImages.size();i++){
+            createBuffer(buffersize,VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         uniformBuffers[i],uniformBuffersMemory[i]);
+        }
+    }
+    //更新uniform 缓冲对象--可以在每一帧产生一个新的变换矩阵
+    void updateUniformBuffer(uint32_t currentImage){
+        static auto startTime = std::chrono::high_resolution_clock::now();
+        auto currentTime = std::chrono::high_resolution_clock::now() ;
+        float time = std::chrono::duration<float,std::chrono::seconds::period>(
+                    currentTime - startTime).count();
+        //我们在uniform缓冲对象中定义我们的MVP变换矩阵
+        //模型的渲染被我们设计成绕 Z 轴渲染 time 弧度。
+        UniformBufferObject ubo = {};
+        /**
+          glm::rotate 函数以矩阵，旋转角度和旋转轴作为参数
+          glm::mat4(1.0f)用于构造单位矩阵
+          通过 time * glm::radians(90.0f) 完成每秒旋转 90 度的操作。
+          */
+        ubo.model = glm::rotate(glm::mat4(1.0f),time*glm::radians(90.0f),
+                                glm::vec3(0.0f,0.0f,1.0f));
+        /**
+         视图变换矩阵
+        glm::lookAt 函数以观察者位置，视点坐标和向上向量为参数生成视图变换矩阵
+         */
+        ubo.view = glm::lookAt(glm::vec3(2.0f,2.0f,2.0f),
+                        glm::vec3(0.0f,0.0f,0.0f),glm::vec3(0.0f,0.0f,1.0f));
+        /**
+          透视变换矩阵
+        glm::perspective 函数以视域的垂直角度，
+            视域的宽高比以及近平面和远平面距离为参数生成透视变换矩阵
+        注意：窗口大小改变后应该使用当前交换链范围来重新计算宽高比
+          */
+        ubo.proj = glm::perspective(glm::radians(45.0f),
+                        swapChainExtent.width/(float)swapChainExtent.height,
+                                    0.1f,10.0f);
+        /**
+        GLM 库最初是为 OpenGL 设计的，它的裁剪坐标的 Y 轴和 Vulkan是相反的。
+        我们可以通过将投影矩阵的 Y 轴缩放系数符号取反来使投影矩阵和 Vulkan 的要求一致。
+        如果不这样做，渲染出来的图像会被倒置.
+          */
+        ubo.proj[1][1] *= -1;
+        //将最后的变换矩阵数据复制到当前帧对应的 uniform 缓冲中
+        void* data ;
+        vkMapMemory( device , uniformBuffersMemory[currentImage],0,
+                     sizeof(ubo) , 0 , &data );
+        memcpy( data , &ubo , sizeof(ubo) );
+        vkUnmapMemory( device , uniformBuffersMemory[currentImage]);
+        /**
+        对于在着色器中使用的需要频繁修改的数据，这样使用 UBO 并非最佳方式。
+        还有一种更加高效的传递少量数据到着色器的方法,之后说
+          */
+    }
+    /**
+     * @brief createDescriptorPool
+     *描述符集不能被直接创建，需要通过描述符池来分配
+     */
+    //描述符池的创建
+    void createDescriptorPool(){
+        //指定描述符池可以分配的描述符集
+        VkDescriptorPoolSize poolSize = {};
+        poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        poolSize.descriptorCount =
+                static_cast<uint32_t>(swapChainImages.size());
+        //指定描述符池的大小，我们会在每一帧分配一个描述符
+        VkDescriptorPoolCreateInfo poolInfo = {};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.poolSizeCount = 1;//最大独立描述符个数外
+        poolInfo.pPoolSizes = &poolSize;
+        //指定可以分配的最大描述符集个数
+        poolInfo.maxSets =
+                static_cast<uint32_t>(swapChainImages.size());;
+
+        if(vkCreateDescriptorPool(device,&poolInfo,nullptr,
+                                  &descriptorPool) != VK_SUCCESS){
+            throw std::runtime_error("failed to create descriptor pool!");
+        }
+    }
+    //创建描述符集对象
+    void createDescriptorSets(){
+        std::vector<VkDescriptorSetLayout> layouts(swapChainImages.size(),
+                                                   descriptorSetLayout);
+        //创建描述符集相关信息
+        VkDescriptorSetAllocateInfo allocInfo = {};
+        allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        //指定分配描述符集对象的描述符池
+        allocInfo.descriptorPool = descriptorPool;
+        //分配的描述符集数量
+        allocInfo.descriptorSetCount =
+                static_cast<uint32_t>(swapChainImages.size());
+        //使用的描述符布局
+        allocInfo.pSetLayouts = layouts.data();
+
+        /**
+        在这里，我们为每一个交换链图像使用相同的描述符布局创建对应的描述符集。
+        但由于描述符布局对象个数要匹配描述符集对象个数，所以，
+        我们还是需要使用多个相同的描述符布局对象。
+          */
+        descriptorSets.resize(swapChainImages.size());
+        //分配地描述符集对象，每一个都带有一个 uniform 缓冲描述符
+        if(vkAllocateDescriptorSets( device , &allocInfo,
+                                     descriptorSets.data()) != VK_SUCCESS){
+            throw std::runtime_error("failed to allocate descriptor sets!");
+        }
+        //配置描述符集对象
+        for(size_t i =0;i<swapChainImages.size();i++){
+            //配置描述符引用的缓冲对象
+            VkDescriptorBufferInfo bufferInfo = {};
+            //以指定缓冲对象
+            bufferInfo.buffer = uniformBuffers[i];
+            bufferInfo.offset = 0;
+            //可以访问的数据范围,
+            //需要使用整个缓冲，可以将range成员变量的值设置为 VK_WHOLE_SIZE
+            bufferInfo.range = sizeof(UniformBufferObject);
+            //更新描述符的配置
+            VkWriteDescriptorSet descriptorWrite = {};
+            descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            //指定要更新的描述符集对象
+            descriptorWrite.dstSet = descriptorSets[i];
+            /**
+            在这里，我们将 uniform 缓冲绑定到索引 0。需要注意描述符可以是数组，
+            所以我们还需要指定数组的第一个元素的索引，在这里，我们
+            没有使用数组作为描述符，将索引指定为 0 即可
+              */
+            //缓冲绑定
+            descriptorWrite.dstBinding = 0;
+            descriptorWrite.dstArrayElement = 0;
+            //指定描述符的类型
+            descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            descriptorWrite.descriptorCount = 1;//指定描述符的数量
+            //指定描述符引用的缓冲数据
+            descriptorWrite.pBufferInfo = &bufferInfo;
+            //指定描述符引用的图像数据
+            descriptorWrite.pImageInfo = nullptr;
+            //指定描述符引用的缓冲视图
+            descriptorWrite.pTexelBufferView = nullptr;
+            /**
+             * @brief vkUpdateDescriptorSets
+             * 函数可以接受两个数组作为参数：
+             * VkWriteDescriptorSet 结构体数组和 VkCopyDescriptorSet 结构体数组。
+             * 后者被用来复制描述符对象
+             */
+            vkUpdateDescriptorSets(device,1,&descriptorWrite,0,nullptr);
+        }
     }
 };
 
