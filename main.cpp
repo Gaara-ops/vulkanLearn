@@ -16,9 +16,11 @@
 来让它使用 Vulkan 的深度值范围 (0.0，1.0)。
   */
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#define GLM_ENABLE_EXPERIMENTAL//启用GLM 库的哈希函数
 #include <glm/glm.hpp>//线性代数库
 //为了使用glm::rotate之类的矩阵变换函数
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtx/hash.hpp>
 //为了使用计时函数,我们将通过计时函数实现每秒旋转 90 度的效果
 #include <chrono>
 /**
@@ -27,6 +29,10 @@
   */
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
+#define TINYOBJLOADER_IMPLEMENTATION
+#include <tiny_obj_loader.h>
+
+#include <unordered_map>
 //顶点结构体
 struct Vertex{
     glm::vec3 pos;
@@ -62,7 +68,24 @@ struct Vertex{
 
         return attributeDescriptions;
     }
+    //重写==运算符
+    bool operator==(const Vertex& other) const {
+        return pos == other.pos &&
+                color == other.color &&
+                texCoord == other.texCoord;
+    }
 };
+//对 Vertex 结构体进行哈希的函数
+namespace std {
+    template<> struct hash<Vertex> {
+        size_t operator()(Vertex const& vertex) const {
+            return ((hash<glm::vec3>()(vertex.pos) ^
+                     (hash<glm::vec3>()(vertex.color) << 1)) >> 1) ^
+                    (hash<glm::vec2>()(vertex.texCoord) << 1);
+        }
+    };
+}
+#if 0
 //定义顶点数据--交叉顶点属性 (interleaving vertex attributes)。
 const std::vector<Vertex> vertices = {
     {{-0.5f ,-0.5f, 0.0f}, {1.0f , 0.0f , 0.0f}, {1.0f,0.0f}},
@@ -80,6 +103,7 @@ const std::vector<uint16_t> indices = {
     0,1,2,2,3,0,
     4,5,6,6,7,4
 };
+#endif
 //着色器中使用的 uniform 数据
 struct UniformBufferObject{
     alignas(16) glm::mat4 model;//模型矩阵
@@ -92,6 +116,11 @@ const int MAX_FRAMES_IN_FLIGHT = 2;
 
 const int WIDTH = 800;
 const int HEIGHT = 600;
+
+const std::string MODEL_PATH=
+        "E:/workspace/Qt5.6/VulkanLearn/models/chalet.obj";
+const std::string TEXTURE_PATH=
+        "E:/workspace/Qt5.6/VulkanLearn/models/chalet.jpg";
 //指定校验层的名称--代表隐式地开启所有可用的校验层--1
 const std::vector<const char*> validataionLayers = {
     "VK_LAYER_LUNARG_standard_validation"
@@ -207,6 +236,9 @@ private:
 
     //标记窗口大小是否发生改变：
     bool framebufferResized = false;
+
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
 
     VkBuffer vertexBuffer;//存储创建的顶点缓冲的句柄
     VkDeviceMemory vertexBufferMemory ;//顶点缓冲的内存句柄
@@ -1510,7 +1542,7 @@ private:
               */
             //绑定顶点缓冲到指令缓冲对象--第三个参数为索引数据的类型
             vkCmdBindIndexBuffer(commandBuffers[i],indexBuffer,0,
-                                 VK_INDEX_TYPE_UINT16);
+                                 VK_INDEX_TYPE_UINT32);
             //为每个交换链图像绑定对应的描述符集
             vkCmdBindDescriptorSets(commandBuffers[i] ,
                             VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1602,6 +1634,7 @@ private:
         createTextureImage();//加载图像数据到一个Vulkan 图像对象
         createTextureImageView();//创建纹理图像的图像视图对象
         createTextureSampler();//创建采样器对象
+        loadModel();//载入模型文件
         createVertexBuffer();//创建顶点缓冲
         createIndexBuffer();//创建索引缓冲
         createUniformBuffer();//创建uniform 缓冲对象
@@ -2510,8 +2543,7 @@ private:
         用 STBI_rgba_alpha 作为通道参数，每个像素需要 4 个字节存储，所有
         像素按照行的方式依次存储.
           */
-        stbi_uc* pixels = stbi_load(
-                    "E:/workspace/Qt5.6/VulkanLearn/textures/texture.jpg",
+        stbi_uc* pixels = stbi_load(TEXTURE_PATH.c_str(),
                                    &texWidth,&texHeight,&texChannels,
                                    STBI_rgb_alpha);
         //图像需要的总字节数
@@ -3058,6 +3090,83 @@ private:
     bool hasStencilComponent(VkFormat format ){
         return format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
                 format == VK_FORMAT_D24_UNORM_S8_UINT;
+    }
+    //载入模型文件,填充模型数据到 vertices 和 indices
+    void loadModel(){
+        /**
+        一个 OBJ 模型文件包含了模型的位置、法线、纹理坐标和表面数据。
+        表面数据包含了构成表面的多个顶点数据的索引。
+        attrib 变量来存储载入的位置、法线和纹理坐标数据。
+        shapes 变量存储独立的对象和它们的表面数据。
+        每个表面数据包含了一个顶点数组，顶点数组中的每个顶点数据包含了顶点的
+        位置索引、法线索引和纹理坐标索引。OBJ 模型文件格式允许为模型的每
+        个表面定义材质和纹理数据，但在这里，我们没有用到。
+        err 变量来存储载入模型文件时产生的错误和警告信息，
+        比如载入时没有找到引用的材质信息。
+        OBJ 模型文件中的表面数据可以包含任意数量的顶点数据，但我们的程序只能渲染三角形表面，
+        这就需要进行转换将 OBJ 模型文件中的表面数据都转换为三角形表面。
+        tinyobj::LoadObj 函数有一个可选的默认参数，可以设置在加载 OBJ 模型
+        数据时将表面数据转换为三角形表面。由于这一设置是默认的，所以，我们不需要自己设置它。
+         */
+        tinyobj::attrib_t attrib;
+        std::vector<tinyobj::shape_t> shapes;
+        std::vector<tinyobj::material_t> materials;
+        std::string warn;
+        std::string err;
+        if(!tinyobj::LoadObj(&attrib,&shapes,&materials,&err,&warn,
+                             MODEL_PATH.c_str())){
+            throw std::runtime_error(warn+err);
+        }
+        /**
+        我们需要达到索引缓冲节约空间的目的。三角形表面的顶点是被多个三角形表面共用的，
+        而我们则是每个顶点都重新定义一次，vertices 向量包含了大量重复的顶点数据。
+        我们可以将完全相同的顶点数据只保留一个，来解决空间。
+        这一去重过程可以通过 STL 的 map 或unordered_map 来实现：
+          */
+        std::unordered_map<Vertex, uint32_t> uniqueVertices;
+
+        //将加载的表面数据复制到我们的 vertices 和 indices 向量中
+        for(const auto& shape : shapes){
+            //载入的表面数据已经被三角形化，所以直接将它们复制到vertices 向量中
+            for(const auto& index: shape.mesh.indices){
+                Vertex vertex = {};
+                /**
+                为了简化 indices 数组的处理，我们这里假定每个顶点都是独一无
+                二的，可以直接使用 indices 数组的当前大小作为顶点索引数据。上面
+                代码中的 index 变量的类型为 tinyobj::index_t，这一类型的变量包含了
+                vertex_index、normal_index 和 texcoord_index 三个成员变量。
+                我们使用这三个成员变量来检索存储在 attrib 数组变量中的顶点数据：
+
+                attrib.vertices 是一个浮点数组，并非 glm::vec3 数组，我们需要在使
+                用索引检索顶点数据时首先要把索引值乘以 3 才能得到正确的顶点数据位
+                置。对于纹理坐标数据，则乘以 2 进行检索。对于顶点位置数据，偏移值
+                0 对应 X 坐标，偏移值 1 对应 Y 坐标，偏移值 2 对应 Z 坐标。对于纹理
+                坐标数据，偏移值 0 对应 U 坐标，偏移值 1 对应 V 坐标
+                  */
+                vertex.pos = {
+                    attrib.vertices[3*index.vertex_index+0],
+                    attrib.vertices[3*index.vertex_index+1],
+                    attrib.vertices[3*index.vertex_index+2]
+                };
+                /**
+                Vulkan的纹理坐标的原点是左上角，而OBJ模型文件格式假设纹理坐标原点是左下角。
+                所以需要反转纹理的 Y 坐标使两个对应
+                  */
+                vertex.texCoord = {
+                    attrib.texcoords[2*index.texcoord_index+0],
+                    1.0f - attrib.texcoords[2*index.texcoord_index+1]
+                };
+                vertex.color = {1.0f,1.0f,1.0f};
+                //优化顶点结构
+                if (uniqueVertices.count(vertex) == 0) {
+                    uniqueVertices[vertex] =
+                            static_cast<uint32_t>(vertices.size());
+                    vertices.push_back(vertex);
+                }
+
+                indices.push_back(uniqueVertices[vertex]);
+            }
+        }
     }
 };
 
