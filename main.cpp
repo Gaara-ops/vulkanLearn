@@ -208,6 +208,9 @@ private:
     VkImage textureImage ;//纹理图像
     VkDeviceMemory textureImageMemory ;//纹理图像对象的内存
 
+    VkImageView textureImageView ;//纹理图像的图像视图对象
+    VkSampler textureSampler ;//采样器对象
+
     //为静态函数才能将其用作回调函数
     static void framebufferResizeCallback(GLFWwindow* window,int width ,
                                            int height){
@@ -417,8 +420,11 @@ private:
             swapChainAdequate= !swapChainSupport.formats.empty()
                     && !swapChainSupport.presentModes.empty();
         }
+        //判断是否支持各向异性过滤
+        VkPhysicalDeviceFeatures supportedFeatures ;
+        vkGetPhysicalDeviceFeatures( device , &supportedFeatures );
         return indices.isComplete() && extensionsSupported &&
-                swapChainAdequate;
+                swapChainAdequate && supportedFeatures.samplerAnisotropy;
 
         //以下代码不使用，仅做了解
         //查询基础设备属性，如名称/类型/支持的vulkan版本
@@ -489,6 +495,8 @@ private:
         }
         //指定应用程序使用的设备特性
         VkPhysicalDeviceFeatures deviceFeatures = {};
+        //各向异性过滤实际上是一个非必需的设备特性,这里指定使用
+        deviceFeatures.samplerAnisotropy = VK_TRUE;
         //创建逻辑设备相关信息
         VkDeviceCreateInfo createInfo = {};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -751,40 +759,8 @@ private:
         swapChainImageViews.resize(swapChainImages.size());
         //遍历所有交换链图像，创建图像视图
         for(size_t i=0; i< swapChainImages.size(); i++){
-            //设置图像视图结构体相关信息
-            VkImageViewCreateInfo createInfo = {};
-            createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-            createInfo.image = swapChainImages[i];
-            //viewType 和 format 成员变量用于指定图像数据的解释方式。
-            //viewType用于指定图像被看作是一维纹理、二维纹理、三维纹理还是立方体贴图
-            createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            createInfo.format = swapChainImageFormat;
-            /**
-            components 成员变量用于进行图像颜色通道的映射。
-            比如，对于单色纹理，我们可以将所有颜色通道映射到红色通道。
-            我们也可以直接将颜色通道的值映射为常数 0 或 1。在这里,我们只使用默认的映射
-              */
-            createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-            //subresourceRange用于指定图像的用途和图像的哪一部分可以被访问
-            //在这里，我们的图像被用作渲染目标，并且没有细分级别，只存在一个图层
-            createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            createInfo.subresourceRange.baseMipLevel = 0;
-            createInfo.subresourceRange.levelCount = 1;
-            createInfo.subresourceRange.baseArrayLayer = 0;
-            createInfo.subresourceRange.layerCount = 1;
-            /**
-            如果读者在编写 VR 一类的应用程序，可能会使用支持多个层次的交换链。
-            这时，读者应该为每个图像创建多个图像视图，分别用来访问左眼和右眼两个不同的图层
-              */
-            //创建图像视图
-            if(vkCreateImageView(device,&createInfo,nullptr,
-                                 &swapChainImageViews[i]) != VK_SUCCESS){
-                throw std::runtime_error("failed to create image views!");
-            }
-            //有了图像视图，就可以将图像作为纹理使用，但作为渲染目标，还需要帧缓冲对象
+            swapChainImageViews[i] = createImageView(swapChainImages[i],
+                                                     swapChainImageFormat);
         }
     }
     //使用我们读取的着色器字节码数组作为参数来创建 VkShaderModule 对象--9
@@ -1511,6 +1487,8 @@ private:
         createFramebuffers();
         createCommandPool();//创建指令池
         createTextureImage();//加载图像数据到一个Vulkan 图像对象
+        createTextureImageView();//创建纹理图像的图像视图对象
+        createTextureSampler();//创建采样器对象
         createVertexBuffer();//创建顶点缓冲
         createIndexBuffer();//创建索引缓冲
         createUniformBuffer();//创建uniform 缓冲对象
@@ -1696,6 +1674,10 @@ private:
     //清理资源
     void cleanup(){
         cleanupSwapChain();//释放交换链相关
+        //清除采样器对象
+        vkDestroySampler(device,textureSampler,nullptr);
+        //清除纹理图像的图像视图对象，
+        vkDestroyImageView ( device , textureImageView , nullptr ) ;
         //销毁纹理对象
         vkDestroyImage(device,textureImage,nullptr);
         //释放纹理对象内存
@@ -2328,13 +2310,13 @@ private:
         region.bufferImageHeight = 0;
         //imageSubresource、imageOffset 和 imageExtent 成员变量用于指定
         //数据被复制到图像的哪一部分
-        region.imageSubresource.aspectMask = ;
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         region.imageSubresource.mipLevel = 0;
         region.imageSubresource.baseArrayLayer = 0;
         region.imageSubresource.layerCount = 1;
 
         region.imageOffset = {0,0,0};
-        region.imageExtent = {width,height};
+        region.imageExtent = {width,height,1};
         /**
         vkCmdCopyBufferToImage 函数的第 4 个参数用于指定目的图像当前使用的图像布局。
         这里我们假设图像已经被变换为最适合作为复制目的的布局。
@@ -2388,6 +2370,7 @@ private:
         memcpy(data,pixels,static_cast<size_t>(imageSize));
         //结束内存映射
         vkUnmapMemory(device,stagingBufferMemory);
+
         //清除图像像素数据
         stbi_image_free( pixels) ;
 
@@ -2407,6 +2390,11 @@ private:
           */
         transitionImageLayout(textureImage,VK_FORMAT_R8G8B8A8_UNORM,
             VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+        copyBufferToImage(stagingBuffer, textureImage,
+                          static_cast<uint32_t>(texWidth),
+                          static_cast<uint32_t>(texHeight));
+
         //为了能够在着色器中采样纹理图像数据,我们还需要进行一次图像布局变换
         transitionImageLayout(textureImage,VK_FORMAT_R8G8B8A8_UNORM,
                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -2497,7 +2485,7 @@ private:
         }
         //获取缓冲的内存需求
         VkMemoryRequirements memRequirements ;
-        vkGetBufferMemoryRequirements(device,image,&memRequirements);
+        vkGetImageMemoryRequirements(device,image,&memRequirements);
 
         VkMemoryAllocateInfo allocInfo = {};
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -2510,7 +2498,7 @@ private:
             throw std::runtime_error("failed to allocate image memory!");
         }
         //将分配的内存和缓冲对象进行关联
-        vkBindBufferMemory(device,image,imageMemory,0);
+        vkBindImageMemory(device,image,imageMemory,0);
     }
     //开始记录传输指令到指令缓冲
     VkCommandBuffer beginSingleTimeCommands(){
@@ -2545,6 +2533,7 @@ private:
             throw std::runtime_error(
                         "failed to begin recording command buffer.");
         }
+        return commandBuffer;
     }
     //结束记录传输指令到指令缓冲
     void endSingleTimeCommands(VkCommandBuffer commandBuffer){
@@ -2595,8 +2584,9 @@ private:
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.image = image;//指定进行布局变换的图像对象
         //subresourceRange表示受影响的图像范围
-        barrier.subresourceRange.aspectMask = 0;
-        barrier.subresourceRange.baseMipLevel = 1;//不使用细分
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0;//不使用细分
+        barrier.subresourceRange.levelCount = 1;
         barrier.subresourceRange.baseArrayLayer = 0;
         barrier.subresourceRange.layerCount = 1;//不使用细分
         /**
@@ -2605,8 +2595,8 @@ private:
         行同步，但还是需要我们进行这一设置。但这一设置依赖旧布局和新布局，
         所以我们会在确定使用的布局变换后再来设置它
           */
-        barrier.srcAccessMask = 0;
-        barrier.dstAccessMask = 0;
+        //barrier.srcAccessMask = 0;
+        //barrier.dstAccessMask = 0;
 
         /**
         传输的写入操作必须在管线传输阶段进行。这里因为我们的写入
@@ -2673,6 +2663,132 @@ private:
                              0,0,nullptr,0,nullptr,1,&barrier);
 
         endSingleTimeCommands( commandBuffer );
+    }
+    //创建纹理图像的图像视图对象
+    void createTextureImageView(){
+        textureImageView = createImageView(textureImage,
+                                           VK_FORMAT_R8G8B8A8_UNORM);
+    }
+    //创建图像视图对象
+    VkImageView createImageView(VkImage image , VkFormat format){
+        //设置图像视图结构体相关信息
+        VkImageViewCreateInfo viewInfo = {};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = image;
+        //viewType 和 format 成员变量用于指定图像数据的解释方式。
+        //viewType用于指定图像被看作是一维纹理、二维纹理、三维纹理还是立方体贴图
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = format;
+        /**
+        components 成员变量用于进行图像颜色通道的映射。
+        比如，对于单色纹理，我们可以将所有颜色通道映射到红色通道。
+        我们也可以直接将颜色通道的值映射为常数 0 或 1。在这里,我们只使用默认的映射
+
+        createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+        createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+        createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+        createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;*/
+        //subresourceRange用于指定图像的用途和图像的哪一部分可以被访问
+        //在这里，我们的图像被用作渲染目标，并且没有细分级别，只存在一个图层
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.baseMipLevel = 0;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.baseArrayLayer = 0;
+        viewInfo.subresourceRange.layerCount = 1;
+        VkImageView imageView;
+        /**
+        如果读者在编写 VR 一类的应用程序，可能会使用支持多个层次的交换链。
+        这时，读者应该为每个图像创建多个图像视图，分别用来访问左眼和右眼两个不同的图层
+          */
+        //创建图像视图
+        if(vkCreateImageView(device,&viewInfo,nullptr,
+                             &imageView) != VK_SUCCESS){
+            throw std::runtime_error("failed to create texture image view!");
+        }
+        return imageView;
+        //有了图像视图，就可以将图像作为纹理使用，但作为渲染目标，还需要帧缓冲对象
+    }
+    //创建采样器对象
+    void createTextureSampler(){
+        //我们会在着色器中使用创建的采样器对象采样纹理数据
+        VkSamplerCreateInfo samplerInfo = {};
+        samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        /**
+        magFilter 和 minFilter 成员变量用于指定纹理需要放大和缩小时使用
+        的插值方法。纹理放大会出现采样过密的问题，纹理缩小会出现采样过疏的问题
+          */
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        /**
+        addressModeU、addressModeV 和 addressModeW 用于指定寻址模式。
+        这里的 U、V、W 对应 X、Y 和 Z 轴。它们的值可以是下面这些：
+        • VK_SAMPLER_ADDRESS_MODE_REPEAT：
+            采样超出图像范围时重复纹理
+        • VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT：
+            采样超出图像范围时重复镜像后的纹理
+        • VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE：
+            采样超出图像范围时使用距离最近的边界纹素
+        • VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE：
+            采样超出图像范围时使用镜像后距离最近的边界纹素
+        • VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER：
+            采样超出图像返回时返回设置的边界颜色
+
+        在这里，我们的采样不会超出图像范围.
+
+          */
+        //VK_SAMPLER_ADDRESS_MODE_REPEAT 来实现平铺纹理的效果
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        /**
+        anisotropyEnable 和 maxAnisotropy 成员变量和各向异性过滤相关。
+        通常来说，只要性能允许，我们都会开启各向异性过滤。maxAnisotropy
+        成员变量用于限定计算最终颜色使用的样本个数。maxAnisotropy 成员变
+        量的值越小，采样的性能表现越好，但采样结果质量较低。目前为止，还
+        没有图形硬件能够使用超过 16 个样本，同时即使可以使用超过 16 个样本，
+        采样效果的增强也开始变得微乎其微。
+          */
+        samplerInfo.anisotropyEnable = VK_TRUE;
+        samplerInfo.maxAnisotropy = 16;
+        /**
+        borderColor 成员变量用于指定使用 VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER
+        寻址模式时采样超出图像范围时返回的边界颜色。边界颜色并非可以设置为任意颜色。
+        它可以被设置为浮点或整型格式的黑色、白色或透明色
+          */
+        samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+        /**
+        unnormalizedCoordinates 成员变量用于指定采样使用的坐标系统。将
+        其设置为 VK_TRUE 时，采样使用的坐标范围为 [0, texWidth) 和 [0,
+        texHeight)。将其设置为 VK_FALSE，采样使用的坐标范围在所有轴都是
+        [0, 1)。通常使用 VK_FALSE 的情况更常见，这种情况下我们可以使用相
+        同的纹理坐标采样不同分辨率的纹理
+          */
+        samplerInfo.unnormalizedCoordinates = VK_FALSE;
+        /**
+        通过 compareEnable 和 compareOp 成员变量，我们可以将样本和一
+        个设定的值进行比较，然后将比较结果用于之后的过滤操作。通常我们在
+        进行阴影贴图时会使用它
+          */
+        samplerInfo.compareEnable = VK_FALSE;
+        samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+        /**
+        mipmapMode、mipLodBias、minLod 和 maxLod 成员变量用于设置
+        分级细化 (mipmap)，它可以看作是过滤操作的一种
+          */
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        samplerInfo.mipLodBias = 0.0f;
+        samplerInfo.minLod = 0.0f;
+        samplerInfo.maxLod = 0.0f;
+        /**
+        需要注意，采样器对象并不引用特定的 VkImage 对象，它是一个用于
+        访问纹理数据的接口。我们可以使用它来访问任意不同的图像，不管图像
+        是一维的、二维的、还是三维的。这和一些旧的图形 API 将纹理图像和过
+        滤设置绑定在一起进行采样是不同的
+          */
+        if(vkCreateSampler(device,&samplerInfo,nullptr,
+                           &textureSampler) != VK_SUCCESS){
+            throw std::runtime_error("failed to create texture sampler!");
+        }
     }
 };
 
