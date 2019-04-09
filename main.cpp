@@ -10,6 +10,12 @@
 #include <set> //使用集合
 #include <fstream>//读取文件
 #define GLM_FORCE_RADIANS//用来使 glm::rotate这些函数使用弧度作为参数的单位
+/**
+默认情况下，GLM 库的透视投影矩阵使用 OpenGL 的深度值范围 (-
+1.0，1.0)。我们需要定义 GLM_FORCE_DEPTH_ZERO_TO_ONE 宏
+来让它使用 Vulkan 的深度值范围 (0.0，1.0)。
+  */
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>//线性代数库
 //为了使用glm::rotate之类的矩阵变换函数
 #include <glm/gtc/matrix_transform.hpp>
@@ -23,7 +29,7 @@
 #include <stb_image.h>
 //顶点结构体
 struct Vertex{
-    glm::vec2 pos;
+    glm::vec3 pos;
     glm::vec3 color;
     glm::vec2 texCoord;//纹理坐标
     //返回 Vertex 结构体的顶点数据存放方式
@@ -41,7 +47,7 @@ struct Vertex{
                 {};
         attributeDescriptions[0].binding = 0;
         attributeDescriptions[0].location = 0;
-        attributeDescriptions[0].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT;
         attributeDescriptions[0].offset = offsetof(Vertex, pos);
 
         attributeDescriptions[1].binding = 0;
@@ -59,14 +65,20 @@ struct Vertex{
 };
 //定义顶点数据--交叉顶点属性 (interleaving vertex attributes)。
 const std::vector<Vertex> vertices = {
-    {{-0.5f ,-0.5f} , {1.0f , 0.0f , 0.0f}, {1.0f,0.0f}} ,
-    {{0.5f , -0.5f} , {0.0f , 1.0f , 0.0f}, {0.0f,0.0f}} ,
-    {{0.5f , 0.5f} ,  {0.0f , 0.0f , 1.0f}, {0.0f,1.0f}} ,
-    {{-0.5f , 0.5f} , {1.0f , 1.0f , 1.0f}, {1.0f,1.0f}}
+    {{-0.5f ,-0.5f, 0.0f}, {1.0f , 0.0f , 0.0f}, {1.0f,0.0f}},
+    {{0.5f , -0.5f, 0.0f}, {0.0f , 1.0f , 0.0f}, {0.0f,0.0f}},
+    {{0.5f , 0.5f , 0.0f},  {0.0f , 0.0f , 1.0f}, {0.0f,1.0f}},
+    {{-0.5f , 0.5f, 0.0f}, {1.0f , 1.0f , 1.0f}, {1.0f,1.0f}},
+
+    {{-0.5f ,-0.5f,-0.5f}, {1.0f , 0.0f , 0.0f}, {1.0f,0.0f}},
+    {{0.5f , -0.5f,-0.5f}, {0.0f , 1.0f , 0.0f}, {0.0f,0.0f}},
+    {{0.5f , 0.5f ,-0.5f},  {0.0f , 0.0f , 1.0f}, {0.0f,1.0f}},
+    {{-0.5f , 0.5f,-0.5f}, {1.0f , 1.0f , 1.0f}, {1.0f,1.0f}}
 };
 //定义索引数据
 const std::vector<uint16_t> indices = {
-    0,1,2,2,3,0
+    0,1,2,2,3,0,
+    4,5,6,6,7,4
 };
 //着色器中使用的 uniform 数据
 struct UniformBufferObject{
@@ -216,6 +228,15 @@ private:
 
     VkImageView textureImageView ;//纹理图像的图像视图对象
     VkSampler textureSampler ;//采样器对象
+
+    /**
+    深度附着和颜色附着一样都是基于图像对象。区别是，交换链不会自
+    动地为我们创建深度附着使用的深度图像对象。我们需要自己创建深度图
+    像对象。使用深度图像需要图像、内存和图像视图对象这三种资源
+     */
+    VkImage depthImage ;
+    VkDeviceMemory depthImageMemory ;
+    VkImageView depthImageView ;
 
     //为静态函数才能将其用作回调函数
     static void framebufferResizeCallback(GLFWwindow* window,int width ,
@@ -764,9 +785,10 @@ private:
         //分配足够的数组空间来存储图像视图
         swapChainImageViews.resize(swapChainImages.size());
         //遍历所有交换链图像，创建图像视图
-        for(size_t i=0; i< swapChainImages.size(); i++){
+        for(uint32_t i=0; i< swapChainImages.size(); i++){
             swapChainImageViews[i] = createImageView(swapChainImages[i],
-                                                     swapChainImageFormat);
+                                                     swapChainImageFormat,
+                                                     VK_IMAGE_ASPECT_COLOR_BIT);
         }
     }
     //使用我们读取的着色器字节码数组作为参数来创建 VkShaderModule 对象--9
@@ -955,6 +977,42 @@ private:
         rasterizer.depthBiasConstantFactor = 0.0f;
         rasterizer.depthBiasClamp = 0.0f;
         rasterizer.depthBiasSlopeFactor = 0.0f;
+
+        //设置深度测试
+        VkPipelineDepthStencilStateCreateInfo depthStencil = {};
+        depthStencil.sType =
+                VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        /**
+        depthTestEnable 成员变量用于指定是否启用深度测试。
+        depthWriteEnable 成员变量用于指定片段通过深度测试后是否写入它的深度值到深度缓冲。
+        使用这两个成员变量可以实现透明效果。透明对象的片段的深度值需
+        要和之前不透明对象片段的深度值进行比较，但透明对象的片段的深度值不需要写入深度缓冲
+          */
+        depthStencil.depthTestEnable = VK_TRUE;
+        depthStencil.depthWriteEnable = VK_TRUE;
+        /**
+        depthCompareOp 成员变量用于指定深度测试使用的比较运算。这里
+        我们指定深度测试使用小于比较运算，这一设置下，新的片段只有在它的
+        深度值小于深度缓冲中的深度值时才会被写入颜色附着
+          */
+        depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+        /**
+        depthBoundsTestEnable、minDepthBounds 和 maxDepthBounds 成员
+        变量用于指定可选的深度范围测试。这一测试开启后只有深度值位于指定
+        范围内的片段才不会被丢弃。这里我们不使用这一功能
+          */
+        depthStencil.depthBoundsTestEnable = VK_FALSE;
+        depthStencil.minDepthBounds = 0.0f;
+        depthStencil.maxDepthBounds = 1.0f;
+        /**
+        stencilTestEnable、front 和 back 成员变量用于模板测试，在我们的教
+        程中没有用到。如果读者想要使用模板测试，需要注意使用包含模板颜色
+        通道的图像数据格式
+          */
+        depthStencil.stencilTestEnable = VK_FALSE;
+        depthStencil.front = {};
+        depthStencil.back ={};
+
         /**
         多重采样是一种组合多个不同多边形产生的片段的颜色来决定
         最终的像素颜色的技术，它可以一定程度上减少多边形边缘的走样现象。
@@ -1061,7 +1119,9 @@ private:
         pipelineInfo.pViewportState = &viewportState;
         pipelineInfo.pRasterizationState = &rasterizer;
         pipelineInfo.pMultisampleState = &multisampling;
-        pipelineInfo.pDepthStencilState = nullptr;
+        //引用我们刚刚设置的深度模板缓冲状态信息
+        //如果渲染流程包含了深度模板附着，那就必须指定深度模板状态信息。
+        pipelineInfo.pDepthStencilState = &depthStencil;
         pipelineInfo.pColorBlendState = &colorBlending;
         pipelineInfo.pDynamicState = nullptr;
         //指定之前创建的管线布局
@@ -1108,6 +1168,27 @@ private:
       */
     //创建渲染流程对象--9
     void createRenderPass(){
+        //设置深度附着信息
+        VkAttachmentDescription depthAttachment = {};
+        //format成员变量的值的设置应该和深度图像的图像数据格式相同
+        depthAttachment.format = findDepthFormat();
+        depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        //绘制结束后不需要从深度缓冲中复制深度数据,所以设备为此值,
+        //这样可以让驱动进行一定程度的优化
+        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        //不需要读取之前深度图像数据,所以设备为此值
+        depthAttachment.finalLayout =
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        VkAttachmentReference depthAttachmentRef = {};
+        depthAttachmentRef.attachment = 1;
+        depthAttachmentRef.layout =
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+
         //代表交换链图像的颜色缓冲附着
         VkAttachmentDescription colorAttachment = {};
         //format指定颜色缓冲附着的格式
@@ -1180,6 +1261,8 @@ private:
         //们指定引用的颜色附着个数和地址
         subpass.colorAttachmentCount = 1;
         subpass.pColorAttachments = &colorAttachmentRef;
+        //为我们仅有的子流程添加对深度附着的引用
+        subpass.pDepthStencilAttachment = &depthAttachmentRef;
 
         //配置子流程依赖
         VkSubpassDependency dependency = {};
@@ -1211,12 +1294,20 @@ private:
         dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
                 | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 
+        /**
+        和颜色附着不同，一个子流程只可以使用一个深度 (或深度模板) 附着。
+        一般而言，也很少有需要多个深度附着的情况
+          */
+        //更新 VkRenderPassCreateInfo 结构体信息引用深度附着
+        std::array<VkAttachmentDescription,2> attachments = {
+                            colorAttachment, depthAttachment};
         //创建渲染流程对象相关信息
         VkRenderPassCreateInfo renderPassInfo = {};
         renderPassInfo.sType =
                 VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-        renderPassInfo.attachmentCount = 1;
-        renderPassInfo.pAttachments = &colorAttachment;
+        renderPassInfo.attachmentCount =
+                static_cast<uint32_t>(attachments.size());
+        renderPassInfo.pAttachments = attachments.data();
         renderPassInfo.subpassCount = 1;
         renderPassInfo.pSubpasses = &subpass;
         //指定渲染流程使用的依赖信息
@@ -1235,8 +1326,13 @@ private:
         swapChainFramebuffers.resize(swapChainImageViews.size());
         for(size_t i = 0;i<swapChainImageViews.size();i++){
             //为交换链的每一个图像视图对象创建对应的帧缓冲
-            VkImageView attachments[] = {
-                swapChainImageViews[i]
+            /**
+            和每个交换链图像对应不同的颜色附着不同，使用我们这里的信号量
+            设置，同时只会有一个子流程在执行，所以，这里我们只需要使用一个深度附着即可
+              */
+            //指定深度图像视图对象作为帧缓冲的第二个附着
+            std::array<VkImageView,2> attachments = {
+                swapChainImageViews[i],depthImageView
             };
             VkFramebufferCreateInfo framebufferInfo = {};
             framebufferInfo.sType =
@@ -1248,9 +1344,10 @@ private:
               */
             framebufferInfo.renderPass = renderPass;
             //指定附着个数
-            framebufferInfo.attachmentCount = 1;
+            framebufferInfo.attachmentCount =
+                    static_cast<uint32_t>(attachments.size());
             //指定渲染流程对象用于描述附着信息的 pAttachment 数组
-            framebufferInfo.pAttachments = attachments;
+            framebufferInfo.pAttachments = attachments.data();
             //指定帧缓冲的大小
             framebufferInfo.width = swapChainExtent.width;
             framebufferInfo.height = swapChainExtent.height;
@@ -1300,6 +1397,10 @@ private:
       */
     //创建指令缓冲对象--11
     void createCommandBuffers(){
+        std::array<VkClearValue,2> clearValues = {};
+        clearValues[0].color = {0.0f , 0.0f , 0.0f , 1.0f};
+        //深度缓冲的初始值应该设置为远平面的深度值,也就是1.0
+        clearValues[1].depthStencil = {1.0f, 0};
         commandBuffers.resize(swapChainFramebuffers.size());
         //指定分配使用的指令池和需要分配的指令缓冲对象个数
         VkCommandBufferAllocateInfo allocInfo = {};
@@ -1364,8 +1465,13 @@ private:
             renderPassInfo.renderArea.extent = swapChainExtent;
             VkClearValue clearColor = {0.0f, 0.0f, 0.0f, 1.0f};
             //指定标记后，使用的清除值
-            renderPassInfo.clearValueCount = 1;
-            renderPassInfo.pClearValues = &clearColor;
+            /**
+            我们使用了多个使用 VK_ATTACHMENT_LOAD_OP_CLEAR
+            标记的附着，这也意味着我们需要设置多个清除值
+              */
+            renderPassInfo.clearValueCount =
+                    static_cast<uint32_t>(clearValues.size());
+            renderPassInfo.pClearValues = clearValues.data();
             /**
             所有可以记录指令到指令缓冲的函数的函数名都带有一个 vkCmd 前缀，
             并且这些函数的返回值都是 void，也就是说在指令记录操作完全结束前，
@@ -1490,8 +1596,9 @@ private:
         createRenderPass();
         createDescriptorSetLayout();//提供着色器使用的每一个描述符绑定信息
         createGraphicsPipeline();//创建图形管线
-        createFramebuffers();
         createCommandPool();//创建指令池
+        createDepthResources();//创建深度图像相关的对象
+        createFramebuffers();
         createTextureImage();//加载图像数据到一个Vulkan 图像对象
         createTextureImageView();//创建纹理图像的图像视图对象
         createTextureSampler();//创建采样器对象
@@ -1913,12 +2020,19 @@ private:
         //视口和裁剪矩形在管线创建时被指定，窗口大小改变，这些设置也需要修改
         //我们可以通过使用动态状态来设置视口和裁剪矩形来避免重建管线
         createGraphicsPipeline();
+        createDepthResources();
         //帧缓冲和指令缓冲直接依赖于交换链图像
         createFramebuffers();
         createCommandBuffers();
     }
     //清除交换链相关
     void cleanupSwapChain(){
+        //销毁图像视图对象
+        vkDestroyImageView(device, depthImageView, nullptr);
+        //销毁深度图像
+        vkDestroyImage(device, depthImage, nullptr);
+        //释放深度图像内存
+        vkFreeMemory(device, depthImageMemory, nullptr);
         //销毁帧缓冲对象
         for(auto framebuffer : swapChainFramebuffers){
             vkDestroyFramebuffer(device,framebuffer,nullptr);
@@ -2637,7 +2751,15 @@ private:
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.image = image;//指定进行布局变换的图像对象
         //subresourceRange表示受影响的图像范围
-        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        if(newLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL){
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            if(hasStencilComponent(format)){
+                barrier.subresourceRange.aspectMask |=
+                        VK_IMAGE_ASPECT_STENCIL_BIT;
+            }
+        }else{
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        }
         barrier.subresourceRange.baseMipLevel = 0;//不使用细分
         barrier.subresourceRange.levelCount = 1;
         barrier.subresourceRange.baseArrayLayer = 0;
@@ -2692,6 +2814,22 @@ private:
             barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
             sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
             destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        }else if(oldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+                 newLayout==VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL){
+            //尽管这里我们没有使用模板颜色通道，我们还是要对它进行变换处理
+            /**
+            深度缓冲数据会在进行深度测试时被读取，用来检测片段是否可以覆盖之前的片段。
+            这一读取过程发生在 VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT，
+            如果片段可以覆盖之前的片段，新的深度缓冲数据会在
+            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT写入。
+            我们应该使用与要进行的操作相匹配的管线阶段进行同步操作.
+              */
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask =
+                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            destinationStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
         }else{
             throw std::invalid_argument("unsupported layout transition!");
         }
@@ -2720,10 +2858,12 @@ private:
     //创建纹理图像的图像视图对象
     void createTextureImageView(){
         textureImageView = createImageView(textureImage,
-                                           VK_FORMAT_R8G8B8A8_UNORM);
+                                           VK_FORMAT_R8G8B8A8_UNORM,
+                                           VK_IMAGE_ASPECT_COLOR_BIT);
     }
     //创建图像视图对象
-    VkImageView createImageView(VkImage image , VkFormat format){
+    VkImageView createImageView(VkImage image , VkFormat format,
+                                VkImageAspectFlags aspectFlags){
         //设置图像视图结构体相关信息
         VkImageViewCreateInfo viewInfo = {};
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -2743,7 +2883,7 @@ private:
         createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;*/
         //subresourceRange用于指定图像的用途和图像的哪一部分可以被访问
         //在这里，我们的图像被用作渲染目标，并且没有细分级别，只存在一个图层
-        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.aspectMask = aspectFlags;
         viewInfo.subresourceRange.baseMipLevel = 0;
         viewInfo.subresourceRange.levelCount = 1;
         viewInfo.subresourceRange.baseArrayLayer = 0;
@@ -2842,6 +2982,82 @@ private:
                            &textureSampler) != VK_SUCCESS){
             throw std::runtime_error("failed to create texture sampler!");
         }
+    }
+    //配置深度图像需要的资源
+    void createDepthResources(){
+        //找一个可用的深度图像数据格式
+        VkFormat depthFormat = findDepthFormat();
+        /**
+         * 我们已经具有足够的信息来创建深度图像对象，
+         * 可以开始调用createImage 和 createImageView 函数来创建图像资源：
+         */
+        createImage(swapChainExtent.width, swapChainExtent.height ,
+                    depthFormat , VK_IMAGE_TILING_OPTIMAL,
+                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, depthImage ,
+                    depthImageMemory);
+        depthImageView = createImageView(depthImage , depthFormat,
+                                         VK_IMAGE_ASPECT_DEPTH_BIT) ;
+        /**
+        接着，就是创建深度图像。通常，我们在渲染流程开始后首先会清除
+        深度附着中的数据，不需要复制数据到深度图像中。我们需要对图像布局
+        进行变换，来让它适合作为深度附着使用。由于这一图像变换只需要进行
+        一次，这里我们使用管线障碍来同步图像变换：
+
+        因为不需要深度图像之前的数据，所以我们使用VK_IMAGE_LAYOUT_UNDEFINED
+          */
+        transitionImageLayout(depthImage , depthFormat ,
+                            VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    }
+    /**
+    可用的深度图像数据格式还依赖于tiling模式和使用标记，所以我们需要将这些信息作为函数参数，
+    通过调用 vkGetPhysicalDeviceFormatProperties 函数查询可用的深度图像数据格式：
+      */
+    //查找一个既符合我们需求又被设备支持的图像数据格式
+    VkFormat findSupportedFormat(const std::vector<VkFormat>& candidates,
+                                 VkImageTiling tiling,
+                                 VkFormatFeatureFlags features){
+        for(VkFormat format : candidates){
+            /**
+            VkFormatProperties 结构体包含了下面这些成员变量：
+            • linearTilingFeatures：数据格式支持线性 tiling 模式
+            • optimalTilingFeatures：数据格式支持优化 tiling 模式
+            • bufferFeatures：数据格式支持缓冲
+            目前我们只用到上面前两个成员变量，通过它们对应的 tiling 模式检
+            测数据格式是否被支持：
+             */
+            VkFormatProperties props ;
+            vkGetPhysicalDeviceFormatProperties(physicalDevice,
+                                                format,&props);
+            if(tiling == VK_IMAGE_TILING_LINEAR &&
+                    (props.linearTilingFeatures & features) == features){
+                return format;
+            }else if(tiling == VK_IMAGE_TILING_OPTIMAL &&
+                     (props.optimalTilingFeatures & features) == features){
+                return format;
+            }
+        }
+        throw std::runtime_error("failed to find supported format!");
+    }
+    //查找适合作为深度附着的图像数据格式
+    VkFormat findDepthFormat(){
+        /**
+        需要注意这里使用的是 VK_FORMAT_FEATURE_ 类的标记而不是
+        VK_IMAGE_USAGE_ 类标记，这一类标记的格式都包含了深度颜色通
+        道，有一些还包含了模板颜色通道，但在这里，我们没有用到模板颜色通道。
+        但如果使用的格式包含模板颜色通道，在进行图像布局变换时就需要考虑这一点。
+          */
+        return findSupportedFormat({VK_FORMAT_D32_SFLOAT,
+                                    VK_FORMAT_D32_SFLOAT_S8_UINT,
+                                   VK_FORMAT_D24_UNORM_S8_UINT},
+                                   VK_IMAGE_TILING_OPTIMAL,
+                               VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    }
+    //检测格式是否包含模板颜色通道
+    bool hasStencilComponent(VkFormat format ){
+        return format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+                format == VK_FORMAT_D24_UNORM_S8_UINT;
     }
 };
 
