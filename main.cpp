@@ -25,6 +25,7 @@
 struct Vertex{
     glm::vec2 pos;
     glm::vec3 color;
+    glm::vec2 texCoord;//纹理坐标
     //返回 Vertex 结构体的顶点数据存放方式
     static VkVertexInputBindingDescription getBindingDescription() {
         VkVertexInputBindingDescription bindingDescription = {};
@@ -34,9 +35,9 @@ struct Vertex{
         return bindingDescription;
     }
 
-    static std::array<VkVertexInputAttributeDescription, 2>
+    static std::array<VkVertexInputAttributeDescription, 3>
                                 getAttributeDescriptions() {
-        std::array<VkVertexInputAttributeDescription,2> attributeDescriptions=
+        std::array<VkVertexInputAttributeDescription,3> attributeDescriptions=
                 {};
         attributeDescriptions[0].binding = 0;
         attributeDescriptions[0].location = 0;
@@ -47,16 +48,21 @@ struct Vertex{
         attributeDescriptions[1].location = 1;
         attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
         attributeDescriptions[1].offset = offsetof(Vertex, color);
+        //使用纹理坐标来将纹理映射到几何图元上
+        attributeDescriptions[2].binding = 0;
+        attributeDescriptions[2].location = 2;
+        attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
 
         return attributeDescriptions;
     }
 };
 //定义顶点数据--交叉顶点属性 (interleaving vertex attributes)。
 const std::vector<Vertex> vertices = {
-    {{-0.5f ,-0.5f} , {1.0f , 0.0f , 0.0f}} ,
-    {{0.5f , -0.5f} , {0.0f , 1.0f , 0.0f}} ,
-    {{0.5f , 0.5f} , {0.0f , 0.0f , 1.0f}} ,
-    {{-0.5f , 0.5f} , {1.0f , 1.0f , 1.0f}}
+    {{-0.5f ,-0.5f} , {1.0f , 0.0f , 0.0f}, {1.0f,0.0f}} ,
+    {{0.5f , -0.5f} , {0.0f , 1.0f , 0.0f}, {0.0f,0.0f}} ,
+    {{0.5f , 0.5f} ,  {0.0f , 0.0f , 1.0f}, {0.0f,1.0f}} ,
+    {{-0.5f , 0.5f} , {1.0f , 1.0f , 1.0f}, {1.0f,1.0f}}
 };
 //定义索引数据
 const std::vector<uint16_t> indices = {
@@ -2132,11 +2138,29 @@ private:
         //用于和图像采样相关的描述符
         uboLayoutBinding.pImmutableSamplers = nullptr ;
 
+        //填写用于组合图像采样器描述符的 VkDescriptorSetLayoutBinding 结构体信息
+        VkDescriptorSetLayoutBinding samplerLayoutBinding = {};
+        samplerLayoutBinding.binding = 1;
+        samplerLayoutBinding.descriptorCount = 1;
+        samplerLayoutBinding.descriptorType =
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        samplerLayoutBinding.pImmutableSamplers = nullptr;
+        /**
+        stageFlags 成员变量指明在片段着色器中使用组合图像采样器描述符。
+        在顶点着色器也可以进行纹理采样，一个常见的用途是在顶点着色
+        器中使用高度图纹理来对顶点进行变形
+          */
+        samplerLayoutBinding.stageFlags =  VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        std::array<VkDescriptorSetLayoutBinding,2> bindings = {
+            uboLayoutBinding,samplerLayoutBinding
+        };
+
         //创建描述符布局相关信息
         VkDescriptorSetLayoutCreateInfo layoutInfo = {};
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        layoutInfo.bindingCount = 1;
-        layoutInfo.pBindings = &uboLayoutBinding;
+        layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+        layoutInfo.pBindings = bindings.data();
         if(vkCreateDescriptorSetLayout(device,&layoutInfo,nullptr,
                                        &descriptorSetLayout)!= VK_SUCCESS){
             throw std::runtime_error("failed to create descriptor set layout");
@@ -2208,16 +2232,24 @@ private:
      */
     //描述符池的创建
     void createDescriptorPool(){
+        //添加一个用于组合图像采样器描述符的VkDescriptorPoolSize 结构体信息
+        std::array<VkDescriptorPoolSize,2> poolSizes = {};
         //指定描述符池可以分配的描述符集
-        VkDescriptorPoolSize poolSize = {};
-        poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        poolSize.descriptorCount =
+        poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        poolSizes[0].descriptorCount =
                 static_cast<uint32_t>(swapChainImages.size());
+
+        //添加图像采样器描述符
+        poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSizes[1].descriptorCount =
+                static_cast<uint32_t>(swapChainImages.size());
+
         //指定描述符池的大小，我们会在每一帧分配一个描述符
         VkDescriptorPoolCreateInfo poolInfo = {};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolInfo.poolSizeCount = 1;//最大独立描述符个数外
-        poolInfo.pPoolSizes = &poolSize;
+        poolInfo.poolSizeCount =
+                static_cast<uint32_t>(poolSizes.size());//最大独立描述符个数外
+        poolInfo.pPoolSizes = poolSizes.data();
         //指定可以分配的最大描述符集个数
         poolInfo.maxSets =
                 static_cast<uint32_t>(swapChainImages.size());;
@@ -2263,35 +2295,56 @@ private:
             //可以访问的数据范围,
             //需要使用整个缓冲，可以将range成员变量的值设置为 VK_WHOLE_SIZE
             bufferInfo.range = sizeof(UniformBufferObject);
+
+            //绑定图像和采样器到描述符集中的描述符
+            VkDescriptorImageInfo imageInfo = {};
+            imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfo.imageView =  textureImageView;
+            imageInfo.sampler = textureSampler;
+            std::array<VkWriteDescriptorSet , 2> descriptorWrites = {};
+
             //更新描述符的配置
-            VkWriteDescriptorSet descriptorWrite = {};
-            descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             //指定要更新的描述符集对象
-            descriptorWrite.dstSet = descriptorSets[i];
+            descriptorWrites[0].dstSet = descriptorSets[i];
             /**
             在这里，我们将 uniform 缓冲绑定到索引 0。需要注意描述符可以是数组，
             所以我们还需要指定数组的第一个元素的索引，在这里，我们
             没有使用数组作为描述符，将索引指定为 0 即可
               */
             //缓冲绑定
-            descriptorWrite.dstBinding = 0;
-            descriptorWrite.dstArrayElement = 0;
+            descriptorWrites[0].dstBinding = 0;
+            descriptorWrites[0].dstArrayElement = 0;
             //指定描述符的类型
-            descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            descriptorWrite.descriptorCount = 1;//指定描述符的数量
+            descriptorWrites[0].descriptorType =
+                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            descriptorWrites[0].descriptorCount = 1;//指定描述符的数量
             //指定描述符引用的缓冲数据
-            descriptorWrite.pBufferInfo = &bufferInfo;
+            descriptorWrites[0].pBufferInfo = &bufferInfo;
             //指定描述符引用的图像数据
-            descriptorWrite.pImageInfo = nullptr;
+            descriptorWrites[0].pImageInfo = nullptr;
             //指定描述符引用的缓冲视图
-            descriptorWrite.pTexelBufferView = nullptr;
+            descriptorWrites[0].pTexelBufferView = nullptr;
+
+            //更新图像和采样器到描述符配置
+            descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[1].dstSet = descriptorSets[i];
+            descriptorWrites[1].dstBinding = 1;
+            descriptorWrites[1].dstArrayElement = 0;
+            descriptorWrites[1].descriptorType =
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            descriptorWrites[1].descriptorCount = 1;//指定描述符的数量
+            descriptorWrites[1].pImageInfo = &imageInfo;
             /**
              * @brief vkUpdateDescriptorSets
              * 函数可以接受两个数组作为参数：
              * VkWriteDescriptorSet 结构体数组和 VkCopyDescriptorSet 结构体数组。
              * 后者被用来复制描述符对象
              */
-            vkUpdateDescriptorSets(device,1,&descriptorWrite,0,nullptr);
+            vkUpdateDescriptorSets(device,
+                    static_cast<uint32_t>(descriptorWrites.size()),
+                                   descriptorWrites.data(),0,nullptr);
+            //更新描述符需要使用图像资源信息。至此，我们就可以在着色器中使用描述符了
         }
     }
     void copyBufferToImage(VkBuffer buffer , VkImage image ,
