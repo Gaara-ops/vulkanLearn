@@ -201,6 +201,7 @@ protected:
             switch (button) {
             case GLFW_MOUSE_BUTTON_LEFT:
                 app->mouseLeftPress = false;
+                app->offSet[0] = 0;
                 std::cout << "left button up!"<<std::endl;
                 break;
             case GLFW_MOUSE_BUTTON_RIGHT:
@@ -215,12 +216,29 @@ protected:
         auto app =
         reinterpret_cast<HelloTriangle*>(glfwGetWindowUserPointer(window));
         if(app->mouseLeftPress){
-            std::cout<<"pos:"<<x<<","<<y<<std::endl;
+            int deltX = x - app->lastPos[0];
+            double delta_azimuth   = -20.0 / WIDTH;
+            double rxf = deltX * delta_azimuth * 10.0;
+            app->offSet[0] = -rxf;
+
+            app->lastPos[0] = x;
+            app->lastPos[1] = y;
+            //std::cout<<"pos:"<<x<<","<<y<<"    "<< deltX<< std::endl;
+        }else{
+            app->lastPos[0] = x;
+            app->lastPos[1] = y;
         }
     }
 
 private:
     bool mouseLeftPress = false;//鼠标左键是否按下
+    int lastPos[2];
+    float offSet[2];
+    float campos[3] = {0.0f,4.0f,0.5f};
+    float focalpos[3] = {0.0f,0.0f,0.5f};
+    float viewup[3] = {0.0f,0.0f,1.0f};
+    glm::mat4 compositeMatrix = glm::mat4(1.0f);
+
     GLFWwindow* window = nullptr;//窗口句柄--1
     VkInstance instance;//vulkan实例句柄--1
     VkDebugUtilsMessengerEXT callback;//存储回调函数信息--1
@@ -554,7 +572,8 @@ private:
     void pickPhysicalDevice(){
         //首先需要请求显卡的数量
         uint32_t deviceCount = 0;
-        vkEnumeratePhysicalDevices(instance,&deviceCount,nullptr);
+        VkResult res = vkEnumeratePhysicalDevices(instance,&deviceCount,nullptr);
+        std::cout << "deviceCount:" << res <<deviceCount << std::endl;
         if(deviceCount == 0){
             throw std::runtime_error(
                         "failed to find gpus with vulkan support!");
@@ -2385,14 +2404,16 @@ private:
           glm::mat4(1.0f)用于构造单位矩阵
           通过 time * glm::radians(90.0f) 完成每秒旋转 90 度的操作。
           */
-        ubo.model = glm::rotate(glm::mat4(1.0f),time*glm::radians(90.0f),
-                                glm::vec3(0.0f,0.0f,1.0f));
+        ubo.model = glm::rotate(compositeMatrix,glm::radians(offSet[0]),
+                                glm::vec3(viewup[0],viewup[1],viewup[2]));
+        compositeMatrix = ubo.model;
         /**
          视图变换矩阵
         glm::lookAt 函数以观察者位置，视点坐标和向上向量为参数生成视图变换矩阵
          */
-        ubo.view = glm::lookAt(glm::vec3(2.0f,2.0f,2.0f),
-                        glm::vec3(0.0f,0.0f,0.0f),glm::vec3(0.0f,0.0f,1.0f));
+        ubo.view = glm::lookAt(glm::vec3(campos[0],campos[1],campos[2]),
+                        glm::vec3(focalpos[0],focalpos[1],focalpos[2]),
+                               glm::vec3(viewup[0],viewup[1],viewup[2]));
         /**
           透视变换矩阵
         glm::perspective 函数以视域的垂直角度，
